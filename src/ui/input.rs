@@ -14,9 +14,6 @@ impl Ui {
         self.s.input_pos = 0;
         self.hist_idx = self.input_hist.len();
         self.hist_draft.clear();
-        if let Some(ai) = &self.ai {
-            ai.warm();
-        }
     }
 
     fn close_input(&mut self) {

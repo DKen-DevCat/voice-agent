@@ -69,6 +69,18 @@ impl WhisperServer {
         })
     }
 
+    /// A server already up at url (a stand-in, for tests).
+    #[cfg(test)]
+    pub fn ready_at(url: &str) -> Arc<WhisperServer> {
+        let s = WhisperServer::new(Path::new("/nonexistent"), Path::new("/nonexistent"), "ja");
+        {
+            let mut st = s.st.lock().unwrap();
+            st.ready = true;
+            st.port = url.rsplit(':').next().and_then(|p| p.parse().ok()).unwrap_or(0);
+        }
+        s
+    }
+
     pub fn is_ready(&self) -> bool {
         self.st.lock().unwrap_or_else(|e| e.into_inner()).ready
     }

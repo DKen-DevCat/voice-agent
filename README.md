@@ -100,6 +100,28 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 - `zsh/`: 裏のシェルに読ませる zsh の設定（OSC 633 でコマンドの終わりと終了コードを知らせます）
 - `voice-agent.lock`: 同じ場所で 2 つ起動しないための印
 - `mcp.json`: Claude Code に渡す MCP の設定（接続用のトークン入り。本人だけが読める 0600 で、終了時に消します）
+- `latency.jsonl`: 返答の速さの記録（下の「返答の速さ」）
+- `phrases/`: 決まった文（確認の文、声のコマンドへの返事など）の音声。AivisSpeech が空いているときに作っておき、すぐに鳴らします。声、速さ、エンジンの版、出力のサンプルレートのどれかが変わると作り直します
+
+## 返答の速さ
+
+話し終えてから返事が聞こえるまでの各段階を、`latency.jsonl` に 1 ターン 1 行で残します。数字は、話し終えた時（Space を離した時、文字を送った時）からのミリ秒です。話した内容は残しません。
+
+| キー | 段階 |
+|---|---|
+| `stt_start` `stt_end` | Whisper が文字起こしを始めた・終えた |
+| `sent` | Claude に送った |
+| `first_text` | 返答の最初の文字が届いた |
+| `first_chunk` | 返答の最初のひと区切りを読み上げに回した |
+| `synth_ask` `synth_start` `synth_end` | その区切りがエンジンを待ち始めた・使い始めた・合成を終えた |
+| `first_sound` | その最初の音をスピーカーに渡した（`say` のときは `say` を起動した時） |
+
+ほかに、最初の区切りを読んだもの（`engine`: aivis、cache、say）、その文字数（`chunk_chars`）、ターンの終わり方（`end`）を書きます。`end` は、音が鳴ったら `sound`、読み上げるものが無ければ `silent`、途中で止めたら `stopped`、Claude が前の返答を続けている間に送ったら `busy`（時刻が前の返答のものになるので計りません）です。決まった文をキャッシュから鳴らしたときは、`"kind":"phrase"` の行に、鳴るまでのミリ秒（`ms`）を書きます。
+
+```sh
+# 音が鳴ったターンの、最初の音までの平均
+jq -s 'map(select(.kind == "turn" and .end == "sound")) | {turns: length, first_sound: (map(.first_sound) | add / length)}' ~/Library/Caches/voice-agent/latency.jsonl
+```
 
 ## 構成
 
@@ -107,19 +129,20 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 src/
   main.rs       起動、端末の入出力、描画のループ
   app.rs        状態機械（待機/聞き取り中/文字起こし中/考え中/実行中/読み上げ中/承認待ち/マイクオフ）
-  config.rs  log.rs  net.rs  util.rs  sysmon.rs（CPU）
+  config.rs  log.rs  latency.rs（返答の速さの記録）  net.rs  util.rs  sysmon.rs（CPU）
   agent/   claude.rs（常駐する stream-json の claude）  stream.rs  agents.rs（サブエージェントの追跡）
            usage.rs（使用量）  mcp.rs（MCP サーバー va）  tools.rs（シェルとジョブのツール）
            policy.rs（承認の判定）  prompt.rs（システムプロンプトと人格の差し込み口）
   shell/   pty.rs  bridge.rs（OSC 633）  zsh/  registry.rs（名前付きの裏のシェル）  jobs.rs
-  speech/  stt.rs（whisper-server）  aivis.rs  tts.rs（文の区切りと読み上げ）  arbiter.rs
+  speech/  stt.rs（whisper-server）  aivis.rs  tts.rs（文の区切りと読み上げ）  phrases.rs（決まった文の音声）
+           arbiter.rs（エンジンを使う順番: 読み上げ、決まった文の作成、温め）
   audio/   capture.rs（マイク）  playback.rs（途切れない再生）  wav.rs
   voice/   commands.rs（声のコマンド）
   ui/      mod.rs（画面の状態とキー）  view.rs（View トレイトと描画）  canvas.rs  mascot.rs
            usage.rs  input.rs  keys.rs  term.rs
 ```
 
-設計と段階（P0〜P7）は [docs/design.md](docs/design.md) にあります。今あるのは P0（土台）です。常時待ち受け（P2）、話者認証（P3）、声での割り込み（P4）はこれからです。
+設計と段階（P0〜P7）は [docs/design.md](docs/design.md) にあります。今あるのは P0（土台）と P1（返答の速さの記録、温めの順番、決まった文のキャッシュ）です。常時待ち受け（P2）、話者認証（P3）、声での割り込み（P4）はこれからです。
 
 ## テスト
 
@@ -127,7 +150,7 @@ src/
 cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 ```
 
-本物のマイクを使うテストは `VA_LIVE_AUDIO=1 cargo test live_ -- --nocapture` で動きます。
+本物のマイクとスピーカーを使うテストは `VA_LIVE_AUDIO=1 cargo test live_ -- --nocapture` で動きます（スピーカーには無音を流します）。
 
 通しの確認には、次の環境変数を使います。
 
@@ -138,6 +161,7 @@ cargo fmt --check && cargo clippy --all-targets -- -D warnings && cargo test
 | `VA_TEST_STEPS` | 決まった時刻に文字を送るか、WAV を文字起こしに回す: `[{"at":3000,"text":"…"},{"at":9000,"wav":"/x.wav"}]` |
 | `VA_TTS_OUT` | 読み上げを、スピーカーではなくこのディレクトリの音声ファイルにする（隣に読んだ文の `.txt`） |
 | `VA_EVENT_LOG` | 出来事を 1 行 1 件の JSON で追記する |
+| `VA_LATENCY_LOG` | 返答の速さの記録（`latency.jsonl`）をこのファイルに書く |
 | `VA_FORCE_KITTY` | `1` にすると、キーを離したことを知らせるターミナルとして扱う（tmux で Space の長押しを試すとき） |
 
 tmux の別ソケットで動かすと、画面とキー操作を確かめられます。
