@@ -36,8 +36,23 @@ struct State {
     generation: u64, // which launch the pid belongs to
     session_id: String,
     announced: String,
-    pending: u32,
+    sent: u64,       // messages sent
+    done: u64,       // of them, answered
+    streaming: bool, // a turn of the main conversation is under way
+    ours: bool,      // ...and it answers a message sent (not one claude started itself)
     req_seq: u32,
+}
+
+impl State {
+    fn turn(&self) -> bool {
+        self.sent > self.done || self.streaming
+    }
+}
+
+/// Whether the turn that was under way when the interrupt went out (the
+/// target-th message) is still not over in the same claude process.
+fn still_running(st: &State, generation: u64, target: u64) -> bool {
+    st.generation == generation && st.done < target
 }
 
 pub struct ClaudeSession {
@@ -63,7 +78,7 @@ impl ClaudeSession {
     }
 
     pub fn busy(&self) -> bool {
-        self.lock().pending > 0
+        self.lock().turn()
     }
 
     fn spawn(self: &Arc<Self>, st: &mut State) -> Result<(), String> {
@@ -117,8 +132,9 @@ impl ClaudeSession {
                     st.stdin = None;
                     st.pid = None;
                 }
-                let had = st.pending > 0;
-                st.pending = 0;
+                let had = st.turn();
+                st.done = st.sent;
+                st.streaming = false;
                 had
             };
             let how = status.map_or_else(|e| e.to_string(), |s| s.to_string());
@@ -151,6 +167,13 @@ impl ClaudeSession {
         // Only the main conversation is spoken; what subagents do is tracked above
         if !m.parent_tool_use_id.is_empty() {
             return;
+        }
+        if m.typ == "stream_event" || m.typ == "assistant" {
+            let mut st = self.lock();
+            if !st.streaming {
+                st.streaming = true;
+                st.ours = st.sent > st.done;
+            }
         }
         match m.typ.as_str() {
             "system" => {
@@ -196,7 +219,11 @@ impl ClaudeSession {
                     if !m.session_id.is_empty() {
                         st.session_id = m.session_id.clone();
                     }
-                    st.pending = st.pending.saturating_sub(1);
+                    // A turn claude started itself answers none of our messages
+                    if !st.streaming || st.ours {
+                        st.done = (st.done + 1).min(st.sent);
+                    }
+                    st.streaming = false;
                 }
                 (self.cb.on_turn_end)(m.is_error, &m.result);
             }
@@ -223,20 +250,22 @@ impl ClaudeSession {
     }
 
     pub fn send(self: &Arc<Self>, text: &str) -> Result<(), String> {
-        self.lock().pending += 1;
+        self.lock().sent += 1;
         let res = self.write(&json!({"type": "user", "message": {"role": "user", "content": text}}));
         if res.is_err() {
             let mut st = self.lock();
-            st.pending = st.pending.saturating_sub(1);
+            st.sent -= 1;
+            st.done = st.done.min(st.sent);
         }
         res
     }
 
     pub fn interrupt(self: &Arc<Self>) {
-        let (id, turn, generation);
+        let (id, turn, generation, target);
         {
             let mut st = self.lock();
-            turn = st.pending > 0;
+            turn = st.turn();
+            target = st.sent;
             // Subagents may be at work in the background after the turn ended
             let agents = self.agents.as_ref().is_some_and(|a| a.running() > 0);
             if st.pid.is_none() || (!turn && !agents) {
@@ -251,12 +280,13 @@ impl ClaudeSession {
             return;
         }
         // Fall back to restarting the process (the conversation resumes) if the
-        // CLI ignores it
+        // CLI ignores it. Only that turn counts: one the user starts right after
+        // is left alone.
         let s = self.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_secs(4));
             let st = s.lock();
-            if st.generation == generation && st.pending > 0 {
+            if still_running(&st, generation, target) {
                 terminate(st.pid);
             }
         });
@@ -299,7 +329,7 @@ mod tests {
     fn reads_the_stream() {
         let (s, seen) = session();
         let mut blocks = HashMap::new();
-        s.lock().pending = 1;
+        s.lock().sent = 1;
         for line in [
             r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-5-5"}"#,
             r#"{"type":"system","subtype":"init","session_id":"s1","model":"claude-sonnet-5-5"}"#,
@@ -321,6 +351,35 @@ mod tests {
         );
         assert!(!s.busy());
         assert_eq!(s.lock().session_id, "s2");
+    }
+
+    /// A turn claude starts itself (relaying a background subagent's result)
+    /// counts as busy, and its end does not use up a message sent meanwhile.
+    #[test]
+    fn turns_claude_starts_itself() {
+        let (s, _) = session();
+        let mut blocks = HashMap::new();
+        let line = |l: &str| l.as_bytes().to_vec();
+        s.on_message(&line(r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text"}}}"#), &mut blocks);
+        assert!(s.busy(), "a relay turn is a turn");
+        s.lock().sent = 1; // the user speaks meanwhile
+        s.on_message(&line(r#"{"type":"result","subtype":"success","result":"relayed"}"#), &mut blocks);
+        assert!(s.busy(), "the user's message is still to be answered");
+        s.on_message(&line(r#"{"type":"result","subtype":"success","result":"answered"}"#), &mut blocks);
+        assert!(!s.busy());
+        let st = s.lock();
+        assert_eq!((st.sent, st.done), (1, 1));
+    }
+
+    /// The fallback after an interrupt ends the process only while the
+    /// interrupted turn is still there, not a turn the user starts after it.
+    #[test]
+    fn the_interrupt_fallback_spares_the_next_turn() {
+        let st = State { generation: 1, sent: 2, done: 1, ..State::default() };
+        assert!(still_running(&st, 1, 2), "the interrupted turn never ended");
+        let st = State { generation: 1, sent: 3, done: 2, ..State::default() };
+        assert!(!still_running(&st, 1, 2), "it ended; the third message is a new turn");
+        assert!(!still_running(&st, 2, 3), "another process");
     }
 
     #[test]

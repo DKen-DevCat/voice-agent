@@ -1,5 +1,7 @@
 //! The HTTP the app speaks as a client: the speech engine and the local
-//! whisper server. Blocking calls; a status is not an error.
+//! whisper server. Blocking calls; a status is not an error. It never goes
+//! through a proxy, whatever the environment says: the recordings stay on
+//! this machine.
 
 use std::sync::OnceLock;
 use std::time::Duration;
@@ -10,7 +12,7 @@ const MAX_BODY: u64 = 64 << 20;
 
 fn agent() -> &'static Agent {
     static AGENT: OnceLock<Agent> = OnceLock::new();
-    AGENT.get_or_init(|| Agent::new_with_config(Agent::config_builder().http_status_as_error(false).user_agent("voice-agent").build()))
+    AGENT.get_or_init(|| Agent::new_with_config(Agent::config_builder().http_status_as_error(false).proxy(None).user_agent("voice-agent").build()))
 }
 
 /// GET url: the status and the body.

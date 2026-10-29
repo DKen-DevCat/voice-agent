@@ -32,7 +32,7 @@ use crate::shell::registry::{MAIN, Registry, ShellOptions};
 use crate::speech::aivis::AivisEngine;
 use crate::speech::stt::WhisperServer;
 use crate::speech::tts::{SentenceChunker, Speaker};
-use crate::util::{fmt_elapsed, home_dir, look_path, unix_millis};
+use crate::util::{fmt_elapsed, home_dir, look_path, unix_millis, write_private};
 use crate::voice::commands::{self, Command};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(180);
@@ -126,6 +126,8 @@ impl Hooks {
 struct Approval {
     id: String,
     answer: mpsc::Sender<(bool, String)>,
+    at: Instant,    // when it was raised: an answer has to begin after it
+    prompt: String, // what is said for it
 }
 
 #[derive(Default)]
@@ -137,9 +139,13 @@ struct State {
     transcribing: u32,
     executing: u32,
     assistant_open: bool,
-    /// 「止めて」 or Esc during a reply: the rest of it is shown, not spoken
+    /// 「止めて」, Esc or talking over a reply: the rest of it is shown, not spoken
     hushed: bool,
     mic_off: bool,
+    /// When the recording under way began
+    began: Option<Instant>,
+    /// What is to be said once the user stops talking (an approval's prompt)
+    deferred: Vec<String>,
     last_status: String,
     ap_seq: u32,
     stt_err: String,
@@ -163,6 +169,7 @@ pub struct Controller {
     shells: Registry,
     jobs: Jobs,
     deny: Vec<DenyRule>,
+    runtime_dir: PathBuf,
     level: Arc<AtomicU64>, // mic level (f64 bits)
     st: Mutex<State>,
 }
@@ -218,7 +225,8 @@ impl Controller {
             let level = Arc::new(AtomicU64::new(0));
             let l = level.clone();
             let shells = Registry::new(ShellOptions { shell: cfg.shell.clone(), dir: cfg.dir.clone(), runtime_dir: runtime_dir.clone() });
-            let jobs = Jobs::new(&cfg.shell, cfg.dir.clone(), runtime_dir);
+            let jobs = Jobs::new(&cfg.shell, cfg.dir.clone(), runtime_dir.clone());
+            let deny = load_deny_rules(&cfg.dir);
             Controller {
                 cfg,
                 hooks,
@@ -233,7 +241,8 @@ impl Controller {
                 usage,
                 shells,
                 jobs,
-                deny: load_deny_rules(),
+                deny,
+                runtime_dir,
                 level,
                 st: Mutex::new(State::default()),
             }
@@ -301,12 +310,15 @@ impl Controller {
         tools.push(self.approve_tool());
         let mcp = McpServer::start("va", tools)?;
         log(&format!("MCP server on 127.0.0.1:{}", mcp.port));
-        let mcp_config = mcp.config();
+        // The config holds the server's token: a file only the user can read,
+        // not claude's arguments, which every account on the Mac can see
+        let mcp_config = self.mcp_config_path();
+        write_private(&mcp_config, mcp.config().as_bytes()).map_err(|e| format!("{}: {e}", mcp_config.display()))?;
         *self.mcp.lock().unwrap_or_else(|e| e.into_inner()) = Some(mcp);
 
         match look_path("claude") {
             None => self.emit(Event::new(EventKind::Error, "claude コマンドが見つかりません。Claude Code をインストールしてください。")),
-            Some(bin) => self.start_claude(bin, mcp_config),
+            Some(bin) => self.start_claude(bin, &mcp_config),
         }
         // After claude: the engine asks reply_expected, which looks at the session
         if let Some(a) = self.speaker.aivis.clone() {
@@ -317,34 +329,12 @@ impl Controller {
         Ok(())
     }
 
-    fn start_claude(self: &Arc<Self>, bin: PathBuf, mcp_config: String) {
-        let system = prompt::system_prompt(&prompt::load_persona(&self.cfg.persona));
-        let mut args: Vec<String> = [
-            "--mcp-config",
-            &mcp_config,
-            "--strict-mcp-config",
-            "--tools",
-            "Read,Edit,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Agent,TaskStop,SendMessage",
-            "--agents",
-            &prompt::subagents().to_string(),
-            "--disallowedTools",
-            "Bash",
-            "--permission-mode",
-            "acceptEdits",
-            "--permission-prompt-tool",
-            APPROVE,
-            "--append-system-prompt",
-            &system,
-        ]
-        .iter()
-        .map(|s| s.to_string())
-        .collect();
-        if !self.cfg.model.is_empty() {
-            args.extend(["--model".to_string(), self.cfg.model.clone()]);
-        }
-        if !self.cfg.effort.is_empty() {
-            args.extend(["--effort".to_string(), self.cfg.effort.clone()]);
-        }
+    fn mcp_config_path(&self) -> PathBuf {
+        self.runtime_dir.join("mcp.json")
+    }
+
+    fn start_claude(self: &Arc<Self>, bin: PathBuf, mcp_config: &std::path::Path) {
+        let args = self.claude_args(mcp_config);
         // A claude started from inside another Claude Code session would refuse to run
         let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
             .filter(|(k, _)| {
@@ -413,6 +403,40 @@ impl Controller {
         }
     }
 
+    /// claude's arguments: the tools, the subagents, the permission handler
+    /// and the system prompt; the MCP server is named by its config file.
+    fn claude_args(&self, mcp_config: &std::path::Path) -> Vec<String> {
+        let system = prompt::system_prompt(&prompt::load_persona(&self.cfg.persona));
+        let mcp_config = mcp_config.to_string_lossy();
+        let mut args: Vec<String> = [
+            "--mcp-config",
+            &mcp_config,
+            "--strict-mcp-config",
+            "--tools",
+            "Read,Edit,Write,Glob,Grep,WebFetch,WebSearch,TodoWrite,Agent,TaskStop,SendMessage",
+            "--agents",
+            &prompt::subagents().to_string(),
+            "--disallowedTools",
+            "Bash",
+            "--permission-mode",
+            "acceptEdits",
+            "--permission-prompt-tool",
+            APPROVE,
+            "--append-system-prompt",
+            &system,
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+        if !self.cfg.model.is_empty() {
+            args.extend(["--model".to_string(), self.cfg.model.clone()]);
+        }
+        if !self.cfg.effort.is_empty() {
+            args.extend(["--effort".to_string(), self.cfg.effort.clone()]);
+        }
+        args
+    }
+
     fn run_test_steps(self: &Arc<Self>) {
         if self.hooks.test_steps.is_empty() {
             return;
@@ -439,7 +463,7 @@ impl Controller {
                 } else if let Ok(data) = std::fs::read(&step.wav) {
                     c.lock().transcribing += 1;
                     c.status();
-                    c.transcribe_counted(&data);
+                    c.transcribe_counted(&data, Instant::now());
                 }
             });
         }
@@ -453,8 +477,9 @@ impl Controller {
             self.emit(Event::new(EventKind::Notice, "（マイクはオフです。m キーで戻せます）"));
             return;
         }
-        // Talking over the assistant silences it (the reply goes on)
-        self.speaker.stop();
+        // Talking over the assistant silences the rest of its reply (the reply
+        // itself goes on, shown)
+        self.hush();
         self.level.store(0f64.to_bits(), Ordering::Relaxed);
         let t0 = Instant::now();
         if let Err(e) = self.rec.start() {
@@ -463,7 +488,11 @@ impl Controller {
             return;
         }
         log(&format!("mic open in {:?}", t0.elapsed()));
-        self.lock().recording = true;
+        {
+            let mut st = self.lock();
+            st.recording = true;
+            st.began = Some(t0);
+        }
         // A reply is coming: get the voice model resident meanwhile
         self.speaker.warm();
         self.status();
@@ -471,7 +500,7 @@ impl Controller {
 
     /// Closes the microphone and sends what was said (cancel: throws it away).
     pub fn stop_recording(self: &Arc<Self>, cancel: bool) {
-        {
+        let (began, deferred) = {
             let mut st = self.lock();
             if !st.recording {
                 return;
@@ -481,8 +510,12 @@ impl Controller {
                 // Straight from listening to transcribing
                 st.transcribing += 1;
             }
-        }
+            (st.began.take().unwrap_or_else(Instant::now), std::mem::take(&mut st.deferred))
+        };
         self.status();
+        for text in deferred {
+            self.speaker.speak(&text);
+        }
         let c = self.clone();
         std::thread::spawn(move || {
             let recorded = c.rec.stop();
@@ -490,7 +523,7 @@ impl Controller {
                 return;
             }
             let notice = match recorded {
-                Some((Ok(wav), secs)) if secs >= 0.35 => return c.transcribe_counted(&wav),
+                Some((Ok(wav), secs)) if secs >= 0.35 => return c.transcribe_counted(&wav, began),
                 Some((Err(RecError::Silence), _)) => Event::new(EventKind::Notice, "（声が聞こえませんでした）"),
                 Some((Err(e), _)) => Event::new(EventKind::Error, e.to_string()),
                 _ => Event::new(EventKind::Notice, "（短すぎて聞き取れませんでした）"),
@@ -533,8 +566,9 @@ impl Controller {
         !self.lock().mic_off
     }
 
-    /// Expects State.transcribing to count this request already.
-    fn transcribe_counted(self: &Arc<Self>, wav: &[u8]) {
+    /// Expects State.transcribing to count this request already. began: when
+    /// the user started saying it.
+    fn transcribe_counted(self: &Arc<Self>, wav: &[u8], began: Instant) {
         let stt = self.stt.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let res = stt.as_ref().map(|s| {
             if !s.is_ready() {
@@ -555,22 +589,48 @@ impl Controller {
             }
             Some(Err(e)) => self.emit(Event::new(EventKind::Error, format!("音声認識エラー: {e}"))),
             Some(Ok(text)) if text.is_empty() => self.emit(Event::new(EventKind::Notice, "（聞き取れませんでした）")),
-            Some(Ok(text)) => self.handle_user_text(&text, "voice"),
+            Some(Ok(text)) => self.handle_heard(&text, "voice", began),
         }
     }
 
     // --- conversation ---
 
-    /// What the user said or typed: a spoken command, the answer to a
-    /// pending approval, or a message for Claude.
+    /// What the user typed (or a test step said), just now.
     pub fn handle_user_text(self: &Arc<Self>, text: &str, via: &str) {
+        self.handle_heard(text, via, Instant::now());
+    }
+
+    /// What the user said or typed, beginning at began: the answer to the
+    /// approval that waits, a spoken command, or a message for Claude.
+    fn handle_heard(self: &Arc<Self>, text: &str, via: &str, began: Instant) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
         self.emit(Event { via: via.to_string(), ..Event::new(EventKind::User, text) });
 
-        if let Some(cmd) = commands::parse(text) {
+        let cmd = commands::parse(text);
+        let first = self.lock().approvals.first().map(|a| (a.id.clone(), a.at));
+        if let Some((id, at)) = first {
+            // Only a clear yes or no answers it, and only one begun after it
+            // was raised (not a request that was under way). 「生成もストップ」
+            // refuses it with everything else; 「静かにして」 only quiets.
+            let answer = if at <= began && cmd != Some(Command::StopAll) { parse_consent(text) } else { None };
+            match (answer, cmd) {
+                (Some(true), _) => self.resolve_approval(&id, true, ""),
+                (Some(false), _) => self.resolve_approval(&id, false, "The user denied this action."),
+                (None, Some(Command::StopAll)) => self.abort(),
+                (None, Some(Command::MicOff)) => self.set_mic(false),
+                (None, Some(Command::Stop)) => self.hush(),
+                (None, None) => {
+                    self.emit(Event::new(EventKind::Notice, format!("（{CONFIRM_AGAIN}）")));
+                    self.announce(CONFIRM_AGAIN);
+                }
+            }
+            return;
+        }
+
+        if let Some(cmd) = cmd {
             match cmd {
                 Command::Stop => self.stop(),
                 Command::StopAll => self.abort(),
@@ -579,24 +639,13 @@ impl Controller {
             return;
         }
 
-        let first = self.lock().approvals.first().map(|a| a.id.clone());
-        if let Some(id) = first {
-            match parse_consent(text) {
-                Some(true) => self.resolve_approval(&id, true, ""),
-                Some(false) => self.resolve_approval(&id, false, "The user denied this action."),
-                // Neither: the approval keeps waiting for a clear answer
-                None => {
-                    self.emit(Event::new(EventKind::Notice, format!("（{CONFIRM_AGAIN}）")));
-                    self.speaker.speak(CONFIRM_AGAIN);
-                }
-            }
-            return;
-        }
-
         let Some(claude) = self.claude() else {
             return self.emit(Event::new(EventKind::Error, "Claude に接続できません。"));
         };
-        self.lock().hushed = false;
+        if !claude.busy() {
+            // A reply silenced before is over; this one is heard
+            self.lock().hushed = false;
+        }
         let msg = format!("{text}\n\n<va_context>main shell cwd: {}</va_context>", self.cwd());
         if let Err(e) = claude.send(&msg) {
             self.emit(Event::new(EventKind::Error, format!("Claude に送れません: {e}")));
@@ -840,15 +889,20 @@ impl Controller {
     /// Asks the user and waits for the answer: (allowed, message for claude).
     fn ask_approval(&self, summary: &str, reason: &str) -> (bool, String) {
         let (tx, rx) = mpsc::channel();
-        let id = {
+        let prompt = format!("確認です。{reason}。実行していいですか？");
+        let (id, first) = {
             let mut st = self.lock();
             st.ap_seq += 1;
             let id = format!("ap{}", st.ap_seq);
-            st.approvals.push(Approval { id: id.clone(), answer: tx });
-            id
+            st.approvals.push(Approval { id: id.clone(), answer: tx, at: Instant::now(), prompt: prompt.clone() });
+            (id, st.approvals.len() == 1)
         };
         self.emit(Event { id: id.clone(), reason: reason.to_string(), ..Event::new(EventKind::Approval, summary) });
-        self.speaker.speak(&format!("確認です。{reason}。実行していいですか？"));
+        // Approvals are answered oldest first: one waiting behind another is
+        // said when its turn comes
+        if first {
+            self.announce(&prompt);
+        }
         self.status();
         match rx.recv_timeout(APPROVAL_TIMEOUT) {
             Ok(answer) => answer,
@@ -860,15 +914,34 @@ impl Controller {
     }
 
     fn resolve_approval(&self, id: &str, allow: bool, message: &str) {
-        let approval = {
+        let (approval, next) = {
             let mut st = self.lock();
-            st.approvals.iter().position(|a| a.id == id).map(|i| st.approvals.remove(i))
+            let i = st.approvals.iter().position(|a| a.id == id);
+            let a = i.map(|i| st.approvals.remove(i));
+            // The one behind it is the one an answer goes to now
+            let next = if i == Some(0) { st.approvals.first().map(|n| n.prompt.clone()) } else { None };
+            (a, next)
         };
         let Some(a) = approval else { return };
         let message = if message.is_empty() { "The user denied this action." } else { message };
         self.emit(Event { id: id.to_string(), allow, ..Event::new(EventKind::ApprovalResolved, "") });
         let _ = a.answer.send((allow, message.to_string()));
+        if let Some(prompt) = next {
+            self.announce(&prompt);
+        }
         self.status();
+    }
+
+    /// Says text now, or once the user stops talking.
+    fn announce(&self, text: &str) {
+        {
+            let mut st = self.lock();
+            if st.recording {
+                st.deferred.push(text.to_string());
+                return;
+            }
+        }
+        self.speaker.speak(text);
     }
 
     fn close_assistant(&self) {
@@ -953,6 +1026,7 @@ impl Controller {
         if let Some(m) = self.mcp.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             m.stop();
         }
+        let _ = std::fs::remove_file(self.mcp_config_path());
         self.shells.close_all();
         self.jobs.stop_all();
     }
@@ -1100,14 +1174,10 @@ mod tests {
     #[test]
     fn spoken_commands_act_at_once() {
         let (c, events) = controller();
-        // 「止めて」 refuses what waits and leaves Claude alone
-        let c2 = c.clone();
-        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "gh pr create"}}))));
-        wait_status(&c, "CONFIRM");
+        // With nothing waiting, 「止めて」 quiets the rest of the reply and leaves Claude alone
         c.handle_user_text("止めて。", "voice");
-        let v = asked.join().unwrap();
-        assert_eq!((v["behavior"].as_str(), v["message"].as_str()), (Some("deny"), Some("The user said stop.")));
         assert!(c.lock().hushed, "the rest of the reply is not spoken");
+        assert!(kinds(&events, EventKind::Notice).iter().any(|e| e.text.contains("止めました")));
 
         c.handle_user_text("生成もストップ", "voice");
         assert!(kinds(&events, EventKind::Notice).iter().any(|e| e.text == ABORTED));
@@ -1125,6 +1195,81 @@ mod tests {
         assert!(kinds(&events, EventKind::Error).is_empty());
         c.handle_user_text("サーバーを止めて", "voice");
         assert_eq!(kinds(&events, EventKind::Error).len(), 1, "a request, not a command");
+    }
+
+    /// While an approval waits: 「止めて」 is a no, 「静かにして」 only quiets the
+    /// speech, and 「生成もストップ」 refuses it with everything else.
+    #[test]
+    fn spoken_commands_while_an_approval_waits() {
+        let (c, _) = controller();
+        let ask = |cmd: &'static str| {
+            let c2 = c.clone();
+            std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": cmd}}))))
+        };
+        let asked = ask("gh pr create");
+        wait_status(&c, "CONFIRM");
+        c.handle_user_text("止めて。", "voice");
+        assert_eq!(asked.join().unwrap()["message"], "The user denied this action.");
+
+        let asked = ask("gh pr create");
+        wait_status(&c, "CONFIRM");
+        c.handle_user_text("静かにして", "voice");
+        assert!(c.lock().hushed && !asked.is_finished(), "it keeps waiting");
+        c.handle_user_text("生成もストップ", "voice");
+        assert_eq!(asked.join().unwrap()["message"], "The user aborted.");
+    }
+
+    /// An utterance that began before the approval was raised (a request
+    /// under way, 「はい、次は…」) does not answer it, even if it is a yes.
+    #[test]
+    fn an_answer_begins_after_the_question() {
+        let (c, events) = controller();
+        let before = Instant::now();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        c.handle_heard("はい", "voice", before);
+        assert!(!asked.is_finished(), "said before the question");
+        assert!(kinds(&events, EventKind::Notice).iter().any(|e| e.text.contains("はいか、いいえ")));
+        c.handle_heard("はい", "voice", Instant::now());
+        assert_eq!(asked.join().unwrap()["behavior"], "allow");
+    }
+
+    /// Two approvals at once (e.g. two subagents): the answer goes to the
+    /// older one, the one the UI shows, then to the next.
+    #[test]
+    fn approvals_are_answered_in_turn() {
+        let (c, events) = controller();
+        let ask = |cmd: &'static str| {
+            let c2 = c.clone();
+            std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": cmd}}))))
+        };
+        // (commands no deny rule of the user's is likely to refuse first)
+        let first = ask("gh pr create --fill");
+        wait_status(&c, "CONFIRM");
+        let second = ask("npm install x");
+        while kinds(&events, EventKind::Approval).len() < 2 {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(c.answer_approval(false));
+        assert_eq!(first.join().unwrap()["behavior"], "deny", "the older one is answered first");
+        assert!(!second.is_finished());
+        assert!(c.answer_approval(true));
+        assert_eq!(second.join().unwrap()["behavior"], "allow");
+    }
+
+    /// claude is told where the MCP config is; the token is not among its
+    /// arguments (every account on the Mac can read those).
+    #[test]
+    fn the_token_stays_out_of_claudes_arguments() {
+        let (c, _) = controller();
+        let path = c.mcp_config_path();
+        let args = c.claude_args(&path);
+        let at = args.iter().position(|a| a == "--mcp-config").unwrap();
+        assert_eq!(args[at + 1], path.to_string_lossy());
+        assert!(args.iter().all(|a| !a.contains("Bearer")), "{args:?}");
+        assert!(args.windows(2).any(|w| w[0] == "--disallowedTools" && w[1] == "Bash"));
+        assert!(args.windows(2).any(|w| w[0] == "--permission-prompt-tool" && w[1] == APPROVE));
     }
 
     #[test]

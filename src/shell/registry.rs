@@ -17,7 +17,8 @@ use crate::util::private_dir;
 pub const MAIN: &str = "main";
 const ROWS: u16 = 50;
 const COLS: u16 = 160;
-const SCROLLBACK: usize = 5000;
+/// Lines of history kept above the screen (shell_screen shows at most 1000)
+const SCROLLBACK: usize = 1000;
 
 #[derive(Clone, Debug)]
 pub struct ShellOptions {
@@ -36,14 +37,16 @@ pub struct Shell {
 }
 
 impl Shell {
-    fn start(name: &str, dir: &std::path::Path, o: &ShellOptions) -> Result<Arc<Shell>, String> {
+    /// fresh: the first shell of this name in this run (its old log is
+    /// emptied; a shell started again carries on in it).
+    fn start(name: &str, dir: &std::path::Path, o: &ShellOptions, fresh: bool) -> Result<Arc<Shell>, String> {
         let zdot = o.runtime_dir.join("zsh");
         write_zsh_files(&zdot).map_err(|e| format!("{}: {e}", zdot.display()))?;
         let shells = o.runtime_dir.join("shells");
         private_dir(&shells).map_err(|e| format!("{}: {e}", shells.display()))?;
         let cmd_file = shells.join(format!("{name}.cmd"));
         let log_path = shells.join(format!("{name}.log"));
-        let log_file = File::create(&log_path).ok();
+        let log_file = std::fs::OpenOptions::new().create(true).write(true).append(!fresh).truncate(fresh).open(&log_path).ok();
         let env = shell_env(&o.shell, &zdot, &cmd_file, name);
         let pty = Arc::new(Pty::spawn(&o.shell, dir, env, ROWS, COLS).map_err(|e| format!("{}: {e}", o.shell))?);
         let p = pty.clone();
@@ -63,6 +66,8 @@ impl Shell {
                 s.screen().process(&shown);
                 s.append_log(&strip_ansi(&String::from_utf8_lossy(&shown)));
             });
+            s.bridge.gone();
+            s.append_log(&format!("\n### {} the shell exited\n", chrono::Local::now().format("%H:%M:%S")));
             log(&format!("shell {}: gone", s.name));
         });
         Ok(shell)
@@ -102,8 +107,10 @@ impl Shell {
         self.bridge.status()
     }
 
+    /// Its end shows on the pty a moment before the process can be reaped:
+    /// either counts.
     pub fn alive(&self) -> bool {
-        !self.pty.exited()
+        !self.bridge.is_gone() && !self.pty.exited()
     }
 
     /// What the shell's screen shows, preceded by up to scrollback lines of
@@ -141,11 +148,13 @@ pub fn valid_name(name: &str) -> bool {
 pub struct Registry {
     opts: ShellOptions,
     shells: Mutex<Vec<Arc<Shell>>>,
+    /// Held while a shell starts, so that two calls cannot start one name twice
+    starting: Mutex<Vec<String>>, // the names started so far
 }
 
 impl Registry {
     pub fn new(opts: ShellOptions) -> Registry {
-        Registry { opts, shells: Mutex::new(Vec::new()) }
+        Registry { opts, shells: Mutex::new(Vec::new()), starting: Mutex::new(Vec::new()) }
     }
 
     fn lock(&self) -> MutexGuard<'_, Vec<Arc<Shell>>> {
@@ -163,7 +172,11 @@ impl Registry {
             return Ok(s);
         }
         if name == MAIN {
-            return self.start(MAIN, None);
+            return match self.start(MAIN, None) {
+                // Started meanwhile by another call
+                Err(_) if self.get(MAIN).is_some() => self.get(MAIN).ok_or_else(|| "the main shell is gone".to_string()),
+                res => res,
+            };
         }
         Err(format!("there is no shell named {name:?} (see shell_list; make one with shell_new)"))
     }
@@ -174,11 +187,16 @@ impl Registry {
         if !valid_name(name) {
             return Err(format!("{name:?} is not a usable shell name (letters, digits, - and _; up to 32)"));
         }
+        let mut started = self.starting.lock().unwrap_or_else(|e| e.into_inner());
         if self.get(name).is_some() {
             return Err(format!("a shell named {name:?} already exists"));
         }
         let dir = dir.unwrap_or_else(|| self.opts.dir.clone());
-        let shell = Shell::start(name, &dir, &self.opts)?;
+        let fresh = !started.iter().any(|n| n == name);
+        let shell = Shell::start(name, &dir, &self.opts, fresh)?;
+        if fresh {
+            started.push(name.to_string());
+        }
         {
             let mut shells = self.lock();
             shells.retain(|s| s.name != name);
@@ -247,6 +265,17 @@ mod tests {
         assert!(reg.start("other", None).is_err());
         assert!(other.run("echo $VA_SHELL", Duration::from_secs(20)).unwrap().output.ends_with("other"));
         assert_eq!(reg.list().len(), 2);
+        // `!` is an ordinary character (no history expansion)
+        let r = main.run("echo \"Fix crash!\"", Duration::from_secs(20)).unwrap();
+        assert_eq!((r.exit_code, r.output.as_str()), (Some(0), "Fix crash!"), "{r:?}");
+        // A shell that exits ends its command at once; main starts again, its log carries on
+        let t0 = std::time::Instant::now();
+        let r = main.run("exit 3", Duration::from_secs(20)).unwrap();
+        assert!(r.shell_exited && t0.elapsed() < Duration::from_secs(10), "{r:?} after {:?}", t0.elapsed());
+        let again = reg.shell(MAIN).unwrap();
+        assert_eq!(again.run("echo back", Duration::from_secs(20)).unwrap().output, "back");
+        let log = std::fs::read_to_string(&again.log_path).unwrap();
+        assert!(log.contains("$ cd / && echo hello") && log.contains("the shell exited") && log.contains("echo back"), "{log}");
         reg.close_all();
         let _ = std::fs::remove_dir_all(&rt);
     }

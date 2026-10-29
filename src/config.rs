@@ -62,7 +62,11 @@ pub fn config_dir(home: &Path) -> PathBuf {
 
 /// `$VA_CONFIG`, else config.json in config_dir.
 fn config_path(home: &Path) -> PathBuf {
-    match std::env::var_os("VA_CONFIG") {
+    config_path_from(std::env::var_os("VA_CONFIG"), home)
+}
+
+fn config_path_from(var: Option<std::ffi::OsString>, home: &Path) -> PathBuf {
+    match var {
         Some(p) if !p.is_empty() => PathBuf::from(p),
         _ => config_dir(home).join("config.json"),
     }
@@ -143,6 +147,14 @@ mod tests {
         assert_eq!(c.aivis_url, "http://h:1");
         assert_eq!((c.aivis_speaker, c.voice_rate, c.hold_ms), (7, 200, 450));
         assert_eq!(c.whisper_model, Path::new("/m.bin"));
+    }
+
+    #[test]
+    fn va_config_names_another_file() {
+        let home = Path::new("/home/u");
+        assert_eq!(config_path_from(None, home), Path::new("/home/u/.config/voice-agent/config.json"));
+        assert_eq!(config_path_from(Some("".into()), home), Path::new("/home/u/.config/voice-agent/config.json"));
+        assert_eq!(config_path_from(Some("/tmp/va/config.json".into()), home), Path::new("/tmp/va/config.json"));
     }
 
     /// README.md's table of the keys lists every key the file is read for,

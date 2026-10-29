@@ -61,6 +61,7 @@ mod tests {
         write_zsh_files(&dir).unwrap();
         let rc = std::fs::read_to_string(dir.join(".zshrc")).unwrap();
         assert!(rc.contains("633;D") && rc.contains("RM_STAR_SILENT") && !rc.contains("GHOSTTY"));
+        assert!(rc.contains("NO_BANG_HIST") && rc.contains("unset HISTFILE"), "no history expansion, no history file");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

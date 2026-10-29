@@ -177,6 +177,8 @@ pub struct Ui {
     space_down: bool,
     space_seq: u64,
     hold_start: i64,
+    /// Approvals waiting, oldest first: the first is shown and is what y/n answers
+    approvals: Vec<LogEntry>,
     note: String,
     note_at: i64,
     effects: Vec<Effect>,
@@ -193,6 +195,7 @@ impl Ui {
             space_down: false,
             space_seq: 0,
             hold_start: 0,
+            approvals: Vec::new(),
             note: String::new(),
             note_at: 0,
             effects: Vec::new(),
@@ -398,7 +401,8 @@ impl Ui {
             EventKind::Agent => return,
             EventKind::Approval => {
                 let entry = LogEntry { kind: e.kind, text: e.text, tag: e.reason, id: e.id, ..LogEntry::default() };
-                self.s.approval = Some(entry.clone());
+                self.approvals.push(entry.clone());
+                self.s.approval = self.approvals.first().cloned();
                 self.add_log(entry);
                 return;
             }
@@ -406,9 +410,8 @@ impl Ui {
                 if let Some(l) = self.s.log.iter_mut().rev().find(|l| l.kind == EventKind::Approval && l.id == e.id) {
                     l.allow = Some(e.allow);
                 }
-                if self.s.approval.as_ref().is_some_and(|a| a.id == e.id) {
-                    self.s.approval = None;
-                }
+                self.approvals.retain(|a| a.id != e.id);
+                self.s.approval = self.approvals.first().cloned();
                 return;
             }
             EventKind::Error => self.s.errors += 1,
@@ -593,6 +596,14 @@ pub mod tests {
         assert_eq!(ui.s.approval.as_ref().map(|a| a.tag.as_str()), Some("リモートへ push します"));
         ui.on_events(vec![Event { id: "ap1".into(), allow: true, ..ev(EventKind::ApprovalResolved, "") }]);
         assert!(ui.s.approval.is_none() && ui.s.log[4].allow == Some(true));
+        // Two at once: the older one is shown (it is what y/n answers), then the next
+        ui.on_events(vec![
+            Event { id: "ap2".into(), ..ev(EventKind::Approval, "rm -r ../shared") },
+            Event { id: "ap3".into(), ..ev(EventKind::Approval, "npm install x") },
+        ]);
+        assert_eq!(ui.s.approval.as_ref().map(|a| a.id.as_str()), Some("ap2"));
+        ui.on_events(vec![Event { id: "ap2".into(), ..ev(EventKind::ApprovalResolved, "") }]);
+        assert_eq!(ui.s.approval.as_ref().map(|a| a.id.as_str()), Some("ap3"));
         ui.on_events(vec![ev(EventKind::Error, "x"), ev(EventKind::Notice, ABORTED)]);
         assert_eq!((ui.s.errors, ui.s.aborts), (1, 1));
     }

@@ -47,6 +47,8 @@ pub struct RunResult {
     pub timed_out: bool,
     pub aborted: bool,
     pub incomplete: bool,
+    /// The shell itself exited while it ran (`exit`, `set -e`)
+    pub shell_exited: bool,
 }
 
 #[derive(Default)]
@@ -60,12 +62,15 @@ struct Job {
     timed_out: bool,
     aborted: bool,
     incomplete: bool,
+    /// Its D marker came with this exit code; it is over once the prompt is back
+    ended: Option<Option<i32>>,
 }
 
 #[derive(Default)]
 struct State {
     integrated: bool,
     idle: bool,
+    gone: bool, // the shell exited
     job: Option<Job>,
     finished: Option<(u64, RunResult)>,
     next_job: u64,
@@ -145,6 +150,10 @@ impl Bridge {
         match kind {
             b'A' => {
                 st.idle = true;
+                // The precmd hook prints D, W, A: the directory is known by now
+                if let Some(code) = st.job.as_ref().and_then(|j| j.ended) {
+                    self.finish(st, code);
+                }
                 self.0.cond.notify_all();
             }
             b'F' => {
@@ -166,8 +175,8 @@ impl Bridge {
                 }
             }
             b'D' => {
-                if st.job.as_ref().is_some_and(|j| j.sent_enter) {
-                    self.finish(st, arg.parse().ok());
+                if let Some(j) = st.job.as_mut().filter(|j| j.sent_enter) {
+                    j.ended = Some(arg.parse().ok());
                 }
             }
             b'W' => st.cwd = arg.to_string(),
@@ -187,6 +196,7 @@ impl Bridge {
             timed_out: j.timed_out,
             aborted: j.aborted,
             incomplete: j.incomplete,
+            shell_exited: st.gone,
         };
         st.finished = Some((j.id, result));
         self.0.cond.notify_all();
@@ -210,6 +220,22 @@ impl Bridge {
         ShellStatus { integrated: st.integrated, idle: st.idle, running: st.job.is_some(), cwd: st.cwd.clone() }
     }
 
+    /// The shell is gone (its pty closed): a command it was running is over.
+    pub fn gone(&self) {
+        let mut st = self.lock();
+        st.gone = true;
+        st.idle = false;
+        if st.job.is_some() {
+            self.finish(&mut st, None);
+        }
+        self.0.cond.notify_all();
+    }
+
+    /// Whether the shell has exited (gone was called).
+    pub fn is_gone(&self) -> bool {
+        self.lock().gone
+    }
+
     /// Waits up to timeout for the shell's first prompt.
     pub fn wait_ready(&self, timeout: Duration) -> bool {
         let deadline = Instant::now() + timeout;
@@ -229,6 +255,9 @@ impl Bridge {
         let id;
         {
             let mut st = self.lock();
+            if st.gone {
+                return Err("the shell has exited".into());
+            }
             if !st.integrated {
                 return Err("shell integration is not active (the shell must be zsh)".into());
             }
@@ -432,9 +461,22 @@ mod tests {
         b.feed(b"\x1b]633;F\x07");
         assert_eq!(sent.lock().unwrap().last().unwrap(), b"\x03");
         b.feed(b"\x1b]633;D;130\x07");
+        assert!(b.lock().finished.is_none(), "over once the prompt is back");
+        b.feed(b"\x1b]633;A\x07");
         let r = b.lock().finished.clone().unwrap().1;
         assert!(r.incomplete);
         assert_eq!(r.exit_code, Some(130));
+    }
+
+    #[test]
+    fn a_shell_that_exits_ends_its_command() {
+        let (b, _) = bridge();
+        b.lock().job = Some(Job { id: 1, sent_enter: true, started: true, ..Job::default() });
+        b.feed(b"\x1b]633;C\x07bye\r\n");
+        b.gone();
+        let r = b.lock().finished.clone().unwrap().1;
+        assert!(r.shell_exited && r.exit_code.is_none() && r.output == "bye", "{r:?}");
+        assert!(b.run("ls", Duration::from_secs(1)).unwrap_err().contains("exited"));
     }
 
     #[test]

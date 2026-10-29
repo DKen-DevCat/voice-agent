@@ -193,7 +193,9 @@ fn shell_run(h: &dyn ToolHost, args: &Map<String, Value>) -> ToolResult {
 
 /// A command's result as shell_run hands it back.
 fn describe_run(r: &RunResult, sec: f64, name: &str, cwd: &str, log: &std::path::Path) -> String {
-    let head = if r.incomplete {
+    let head = if r.shell_exited {
+        "The shell exited while the command ran (exit, or set -e?); the next command starts a new one in the default directory.".to_string()
+    } else if r.incomplete {
         "The command was incomplete (unterminated quote or heredoc?) and was cancelled with Ctrl-C.".to_string()
     } else if r.timed_out {
         format!("Timed out after {sec}s and was interrupted with Ctrl-C.")

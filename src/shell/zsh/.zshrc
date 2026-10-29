@@ -1,12 +1,14 @@
 ZDOTDIR="$VA_USER_ZDOTDIR"
-# /etc/zshrc ran while ZDOTDIR pointed here; keep history in the user's usual file
-[[ "$HISTFILE" == "$__va_zdotdir"/* ]] && HISTFILE="$ZDOTDIR/.zsh_history"
 [[ -f "$ZDOTDIR/.zshrc" ]] && builtin source "$ZDOTDIR/.zshrc"
 # ZDOTDIR stays on the user's dir from here, so zsh reads their .zlogin itself.
 unset __va_zdotdir
 
-# Nobody watches this shell: nothing may stop to ask or page
-setopt RM_STAR_SILENT NO_CORRECT NO_CORRECT_ALL
+# Nobody watches this shell: nothing may stop to ask or page. `!` is just a
+# character (no history expansion: "Fix crash!" stays as written), and what
+# the AI runs stays out of the user's history.
+setopt RM_STAR_SILENT NO_CORRECT NO_CORRECT_ALL NO_BANG_HIST
+unset HISTFILE
+SAVEHIST=0
 export PAGER=cat GIT_PAGER=cat GIT_EDITOR=true EDITOR=true VISUAL=true
 
 # OSC 633 markers are taken out of the stream by voice-agent. They tell it

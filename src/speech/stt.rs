@@ -74,8 +74,9 @@ impl WhisperServer {
     }
 
     /// Launches the server if needed and waits until it accepts requests. A
-    /// failed launch is retried on the next call.
-    pub fn start(&self) -> Result<(), String> {
+    /// failed launch is retried on the next call, and so is one whose server
+    /// has died since.
+    pub fn start(self: &Arc<Self>) -> Result<(), String> {
         let mut st = self.st.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if st.ready {
@@ -100,13 +101,18 @@ impl WhisperServer {
         res
     }
 
-    fn launch(&self) -> Result<(), String> {
+    fn launch(self: &Arc<Self>) -> Result<(), String> {
         let port = free_port().map_err(|e| e.to_string())?;
         // whisper-server would outlive a crashed voice-agent; run it under a
         // shell that kills it as soon as our end of its stdin closes (exit,
-        // crash, kill -9)
+        // crash, kill -9), and that itself ends with the server, so that its
+        // end is seen. (A job in the background reads /dev/null: the watcher
+        // reads stdin through fd 3.)
         let mut child = Command::new("/bin/sh")
-            .args(["-c", r#""$0" "$@" & child=$!; read _; kill $child"#])
+            .args([
+                "-c",
+                r#"exec 3<&0; "$0" "$@" </dev/null & child=$!; (read _ <&3; kill $child 2>/dev/null) & watcher=$!; wait $child; status=$?; kill $watcher 2>/dev/null; exit $status"#,
+            ])
             .arg(&self.bin)
             .arg("-m")
             .arg(&self.model)
@@ -140,9 +146,16 @@ impl WhisperServer {
                 return Err(format!("whisper-server exited ({status}): {}", last_line.lock().unwrap_or_else(|e| e.into_inner())));
             }
             if TcpStream::connect_timeout(&addr, Duration::from_millis(200)).is_ok() {
-                // Reaps the shell when the server ends
+                // When the server ends, the next utterance starts it again
+                let s = self.clone();
                 std::thread::spawn(move || {
-                    let _ = child.wait();
+                    let status = child.wait();
+                    log(&format!("whisper-server ended: {}", status.map_or_else(|e| e.to_string(), |s| s.to_string())));
+                    let mut st = s.st.lock().unwrap_or_else(|e| e.into_inner());
+                    if st.port == port {
+                        st.ready = false;
+                        st.stdin = None;
+                    }
                 });
                 return Ok(());
             }
@@ -152,7 +165,7 @@ impl WhisperServer {
         Err("whisper-server did not start within 5 minutes".into())
     }
 
-    pub fn transcribe(&self, wav: &[u8]) -> Result<String, String> {
+    pub fn transcribe(self: &Arc<Self>, wav: &[u8]) -> Result<String, String> {
         self.start()?;
         let port = self.st.lock().unwrap_or_else(|e| e.into_inner()).port;
         transcribe_at(&format!("http://127.0.0.1:{port}/inference"), wav)
@@ -195,6 +208,24 @@ mod tests {
         assert_eq!(clean_transcript("(音楽)"), "");
         assert_eq!(clean_transcript(" 。 "), "");
         assert_eq!(clean_transcript("ls を実行して"), "ls を実行して");
+    }
+
+    /// A server that cannot start is seen at once (not after 5 minutes), and
+    /// the next call tries again.
+    #[test]
+    fn a_server_that_dies_is_seen() {
+        let dir = std::env::temp_dir().join(format!("va-stt-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("whisper-server");
+        std::fs::write(&bin, "#!/bin/sh\necho 'error: failed to load model' >&2\nexit 1\n").unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let s = WhisperServer::new(&bin, Path::new("/m.bin"), "ja");
+        let t0 = Instant::now();
+        let err = s.start().unwrap_err();
+        assert!(err.contains("exited") && t0.elapsed() < Duration::from_secs(10), "{err} after {:?}", t0.elapsed());
+        assert!(s.start().is_err(), "tried again");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

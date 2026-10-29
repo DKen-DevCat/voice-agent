@@ -178,3 +178,19 @@ fn run() -> i32 {
     drop(term);
     0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn one_instance_per_runtime_directory() {
+        let rt = std::env::temp_dir().join(format!("va-lock-{}", std::process::id()));
+        std::fs::create_dir_all(&rt).unwrap();
+        let first = lock(&rt).unwrap();
+        assert!(lock(&rt).unwrap_err().contains("もう動いています"));
+        drop(first);
+        assert!(lock(&rt).is_ok(), "free again once the first one is gone");
+        let _ = std::fs::remove_dir_all(&rt);
+    }
+}
