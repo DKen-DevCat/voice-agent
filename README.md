@@ -101,11 +101,11 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 - `voice-agent.lock`: 同じ場所で 2 つ起動しないための印
 - `mcp.json`: Claude Code に渡す MCP の設定（接続用のトークン入り。本人だけが読める 0600 で、終了時に消します）
 - `latency.jsonl`: 返答の速さの記録（下の「返答の速さ」）
-- `phrases/`: 決まった文（確認の文、声のコマンドへの返事など）の音声。AivisSpeech が空いているときに作っておき、すぐに鳴らします。声、速さ、エンジンの版、出力のサンプルレートのどれかが変わると作り直します
+- `phrases/`: 決まった文（確認の文、声のコマンドへの返事など）の音声。AivisSpeech が空いているときに作っておき、すぐに鳴らします。声、速さ、エンジンの版のどれかが変わると作り直します（出力デバイスを替えても作り直さず、再生するときに変換します）
 
 ## 返答の速さ
 
-話し終えてから返事が聞こえるまでの各段階を、`latency.jsonl` に 1 ターン 1 行で残します。数字は、話し終えた時（Space を離した時、文字を送った時）からのミリ秒です。話した内容は残しません。
+話し終えてから返事が聞こえるまでの各段階を、`latency.jsonl` に 1 ターン 1 行で残します。数字は、話し終えた時（Space を離した時、文字を送った時）からのミリ秒です。話した内容と Claude の返答は残しません。
 
 | キー | 段階 |
 |---|---|
@@ -116,11 +116,28 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 | `synth_ask` `synth_start` `synth_end` | その区切りがエンジンを待ち始めた・使い始めた・合成を終えた |
 | `first_sound` | その最初の音をスピーカーに渡した（`say` のときは `say` を起動した時） |
 
-ほかに、最初の区切りを読んだもの（`engine`: aivis、cache、say）、その文字数（`chunk_chars`）、ターンの終わり方（`end`）を書きます。`end` は、音が鳴ったら `sound`、読み上げるものが無ければ `silent`、途中で止めたら `stopped`、Claude が前の返答を続けている間に送ったら `busy`（時刻が前の返答のものになるので計りません）です。決まった文をキャッシュから鳴らしたときは、`"kind":"phrase"` の行に、鳴るまでのミリ秒（`ms`）を書きます。
+ほかに、最初の区切りを読んだもの（`engine`: aivis、cache、say）、その文字数（`chunk_chars`）、Whisper の起動を待ったこと（`stt_cold`。このときの `stt_start` は起動が終わった時）、ターンの終わり方（`end`）を書きます。
+
+| `end` | ターンの終わり方 |
+|---|---|
+| `sound` | 返答の音が鳴った |
+| `silent` | 読み上げるものが無かった（返答に文字が無い、読み上げがオフ） |
+| `stopped` | 鳴る前に止めた（話し始めた、Esc、「止めて」） |
+| `error` | Whisper、Claude、返答の最初の区切りの読み上げのどれかが失敗した |
+| `busy` | Claude が前の返答を続けている間に送った（時刻が前の返答のものになるので計らない） |
+| `command` | 声のコマンドだった |
+| `approval` | 承認への答えだった。または、返答が鳴る前に承認の確認が入った（時刻が承認を待った時間になる） |
+| `no-speech` | 声が無い、短すぎる、聞き取れなかった |
+| `superseded` | 自分では終わらなかった（Claude が次の返答に移った、など） |
+| `quit` | 終わる前に voice-agent を閉じた |
+
+文字で送ったときに前の返答をまだ読み上げていたら、新しい返答はその後に鳴るので、`first_sound` にはその待ち時間も入ります（声のときは、話し始めた時点で読み上げを止めます）。
+
+読み上げの最初に（前に待っているものが無いときに）決まった文をキャッシュから鳴らしたときは、`"kind":"phrase"` の行に、鳴らした決まった文（`text`）と、鳴るまでのミリ秒（`ms`）を書きます。
 
 ```sh
-# 音が鳴ったターンの、最初の音までの平均
-jq -s 'map(select(.kind == "turn" and .end == "sound")) | {turns: length, first_sound: (map(.first_sound) | add / length)}' ~/Library/Caches/voice-agent/latency.jsonl
+# 音が鳴ったターンの、最初の音までの平均（Whisper の起動を待ったターンは除く）
+jq -s 'map(select(.kind == "turn" and .end == "sound" and (.stt_cold | not))) | {turns: length, first_sound: (map(.first_sound) | add / length)}' ~/Library/Caches/voice-agent/latency.jsonl
 ```
 
 ## 構成

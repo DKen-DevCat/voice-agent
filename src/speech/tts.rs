@@ -13,7 +13,7 @@ use regex::Regex;
 
 use super::aivis::{AivisEngine, excerpt};
 use super::phrases::Phrases;
-use crate::audio::playback::{Pcm, PcmPlayer, pause_after, wav_pcm};
+use crate::audio::playback::{DEFAULT_RATE, Pcm, PcmPlayer, pause_after, wav_pcm};
 use crate::log::log;
 
 /// Spoken in place of a fenced code block.
@@ -210,13 +210,13 @@ fn join_speech(a: &str, b: &str) -> String {
 struct Item {
     text: String,
     wav: Option<Vec<u8>>, // from the phrase cache
-    reply: bool,          // a piece of Claude's reply (not something voice-agent says itself)
+    turn: u64,            // the latency log's turn this is the reply to (0: voice-agent's own words)
     asked: Instant,       // when it was handed to speech
 }
 
 impl Item {
-    fn new(text: &str, reply: bool) -> Item {
-        Item { text: text.to_string(), wav: None, reply, asked: Instant::now() }
+    fn new(text: &str, turn: u64) -> Item {
+        Item { text: text.to_string(), wav: None, turn, asked: Instant::now() }
     }
 }
 
@@ -225,15 +225,15 @@ impl Item {
 /// a comma. first (nothing is playing) keeps the chunk short so audio starts
 /// sooner: short sentences merge only up to FIRST_MIN, and a longer one ends
 /// at its first comma past FIRST_MIN characters. A cached phrase goes alone
-/// and as it is.
+/// and as it is, and the reply to another turn starts a chunk of its own.
 fn take_chunk(queue: &mut VecDeque<Item>, first: bool, limit: usize) -> Item {
-    let mut chunk = queue.pop_front().unwrap_or_else(|| Item::new("", false));
+    let mut chunk = queue.pop_front().unwrap_or_else(|| Item::new("", 0));
     if chunk.wav.is_some() {
         return chunk;
     }
     let mut n = chunk.text.chars().count();
     while let Some(next) = queue.front() {
-        if next.wav.is_some() || (first && n >= FIRST_MIN) {
+        if next.wav.is_some() || next.turn != chunk.turn || (first && n >= FIRST_MIN) {
             break;
         }
         let m = next.text.chars().count();
@@ -241,7 +241,6 @@ fn take_chunk(queue: &mut VecDeque<Item>, first: bool, limit: usize) -> Item {
             break;
         }
         chunk.text = join_speech(&chunk.text, &next.text);
-        chunk.reply |= next.reply;
         n += m;
         queue.pop_front();
     }
@@ -311,14 +310,15 @@ pub struct Clip {
     pub wav: Option<Vec<u8>>,
     pub pcm: Option<Pcm>, // wav's samples plus a pause, for gapless playback
     pub text: String,
-    note: Option<Note>, // for the latency log; None for a skipped chunk
+    note: Option<Note>, // for the latency log; None for a chunk stopped with its run
 }
 
 /// Where a clip came from, for the latency log.
 #[derive(Clone)]
 struct Note {
-    reply: bool,
+    turn: u64,
     cached: bool,
+    lead: bool, // the first chunk of its run
     asked: Instant,
     synth: Option<SynthTiming>,
 }
@@ -331,25 +331,28 @@ pub struct SynthTiming {
     pub done: Instant,
 }
 
-/// A clip that started to sound, as the latency log learns of it.
+/// A clip that started to sound, or was skipped, as the latency log learns
+/// of it.
 #[derive(Clone, Debug)]
 pub struct Sounded {
     pub text: String,
-    pub reply: bool,  // a piece of Claude's reply
+    pub turn: u64,    // the turn it is the reply to (see Item)
     pub cached: bool, // from the phrase cache
     pub say: bool,    // spoken by `say`
-    pub first: bool,  // nothing of its run sounded before it
+    pub first: bool,  // the first chunk of its run: nothing was ahead of it
     pub asked: Instant,
     pub synth: Option<SynthTiming>,
     /// Its first sample went to the speakers (for `say`, afplay and files:
-    /// when they were started)
-    pub at: Instant,
+    /// when they were started, told once they played); None: it was skipped
+    /// (the engine or the player failed on it) and never sounded
+    pub at: Option<Instant>,
 }
 
 impl Clip {
-    fn sounded(&self, at: Instant) -> Option<Sounded> {
+    fn sounded(&self, at: Option<Instant>) -> Option<Sounded> {
         let n = self.note.as_ref()?;
-        Some(Sounded { text: self.text.clone(), reply: n.reply, cached: n.cached, say: self.wav.is_none(), first: false, asked: n.asked, synth: n.synth, at })
+        let say = self.wav.is_none() && !self.text.is_empty();
+        Some(Sounded { text: self.text.clone(), turn: n.turn, cached: n.cached, say, first: n.lead, asked: n.asked, synth: n.synth, at })
     }
 }
 
@@ -370,8 +373,10 @@ struct Run {
     wake: Arc<(Mutex<bool>, Condvar)>, // text was queued or a clip was heard
     ahead: usize,                      // chunks taken for synthesis and not yet heard
     last: usize,                       // characters in the latest chunk
+    taken: usize,                      // chunks taken so far
     say: bool,                         // this run speaks with `say` (the engine was down)
-    voiced: bool,                      // this run has AivisSpeech audio: it never turns to `say`
+    voiced: bool,                      // the engine made audio for this run: it never turns to `say`
+    lost: bool,                        // the engine went away after that: what needs it is skipped
 }
 
 fn poke(wake: &(Mutex<bool>, Condvar)) {
@@ -411,9 +416,17 @@ pub struct Speaker {
 }
 
 enum Next {
-    Take(Item, bool), // the chunk, and whether it goes to `say`
+    Take(Item, Plan),
     Wait,
     Over,
+}
+
+/// How a chunk taken off the queue is to be made into a clip.
+#[derive(Clone, Copy)]
+struct Plan {
+    say: bool,  // it goes to `say`
+    lost: bool, // the engine went away mid-run: skipped unless cached
+    lead: bool, // the first chunk of its run
 }
 
 impl Speaker {
@@ -478,42 +491,43 @@ impl Speaker {
         if let (Some(a), Some(p)) = (&self.aivis, &self.phrases)
             && self.is_enabled()
         {
-            let rate = self.player.as_ref().map_or_else(|| a.rate.load(Ordering::SeqCst), |p| p.rate());
-            p.build(a, rate, texts);
+            p.build(a, texts);
         }
     }
 
     /// Says something of voice-agent's own (an approval, a notice).
     pub fn speak(self: &Arc<Self>, text: &str) {
-        self.enqueue(text, false);
+        self.enqueue(text, 0);
     }
 
-    /// Says a piece of Claude's reply.
-    pub fn speak_reply(self: &Arc<Self>, text: &str) {
-        self.enqueue(text, true);
+    /// Says a piece of Claude's reply to turn (the latency log's); false when
+    /// nothing was queued (speech is off, or there were no words).
+    pub fn speak_reply(self: &Arc<Self>, text: &str, turn: u64) -> bool {
+        self.enqueue(text, turn)
     }
 
     /// Queues text sentence by sentence; a sentence the phrase cache has is
     /// played from there.
-    fn enqueue(self: &Arc<Self>, text: &str, reply: bool) {
+    fn enqueue(self: &Arc<Self>, text: &str, turn: u64) -> bool {
         let pieces: Vec<Item> = split_sentences(text)
             .into_iter()
             .map(|t| {
                 let wav = self.phrases.as_ref().and_then(|p| p.get(&t));
-                Item { wav, ..Item::new(&t, reply) }
+                Item { wav, ..Item::new(&t, turn) }
             })
             .collect();
         let (wake, starting);
         {
             let mut st = self.lock();
             if !st.enabled || pieces.is_empty() {
-                return;
+                return false;
             }
             st.queue.extend(pieces);
             starting = st.cur.is_none();
             if starting {
                 st.next_run += 1;
-                let run = Run { id: st.next_run, cancel: Cancel::new(), wake: Arc::default(), ahead: 0, last: 0, say: false, voiced: false };
+                let run =
+                    Run { id: st.next_run, cancel: Cancel::new(), wake: Arc::default(), ahead: 0, last: 0, taken: 0, say: false, voiced: false, lost: false };
                 let (s, id, cancel, w) = (self.clone(), run.id, run.cancel.clone(), run.wake.clone());
                 st.cur = Some(run);
                 std::thread::spawn(move || s.produce(id, cancel, w));
@@ -526,6 +540,7 @@ impl Speaker {
         if starting {
             (self.on_change)();
         }
+        true
     }
 
     /// Synthesizes the queue chunk by chunk until the run is over.
@@ -546,8 +561,8 @@ impl Speaker {
                         break;
                     }
                 }
-                Next::Take(chunk, say) => {
-                    let clip = self.prepare(id, &cancel, &chunk, say);
+                Next::Take(chunk, plan) => {
+                    let clip = self.prepare(id, &cancel, &chunk, plan);
                     if cancel.is_cancelled() || tx.send(Ev::Clip(clip)).is_err() {
                         break;
                     }
@@ -564,16 +579,17 @@ impl Speaker {
         let mut guard = self.lock();
         let st = &mut *guard;
         let Some(r) = st.cur.as_mut().filter(|r| r.id == id) else { return Next::Over };
-        if !r.say && self.aivis.as_ref().is_none_or(|a| a.is_down()) {
-            // No switching voices mid-reply: a run that has not spoken yet stays
-            // `say` to its end, and one that lost the engine after speaking with
-            // it leaves the rest unheard
+        let down = self.aivis.as_ref().is_none_or(|a| a.is_down());
+        let needs_engine = self.aivis.is_none() || st.queue.front().is_some_and(|i| i.wav.is_none());
+        if down && needs_engine && !r.say && !r.lost {
+            // No switching voices mid-reply: a run the engine has made nothing
+            // for yet goes on with `say` to its end, and one it has leaves the
+            // rest of what needs the engine unheard. Cached audio needs no
+            // engine (nor does it show that the engine is there): it plays on
             if r.voiced {
-                if !st.queue.is_empty() {
-                    let rest: String = st.queue.iter().map(|i| i.text.as_str()).collect();
-                    log(&format!("tts: engine lost mid-reply; not spoken: {:?}", excerpt(&rest)));
-                }
-                st.queue.clear();
+                let rest: String = st.queue.iter().filter(|i| i.wav.is_none()).map(|i| i.text.as_str()).collect();
+                log(&format!("tts: engine lost mid-reply; not spoken: {:?}", excerpt(&rest)));
+                r.lost = true;
             } else {
                 r.say = true;
             }
@@ -581,15 +597,15 @@ impl Speaker {
         if !st.queue.is_empty() && (r.ahead == 0 || (!r.say && r.ahead < MAX_AHEAD)) {
             let chunk = if r.say {
                 // `say` gains nothing from preparing early and pauses at every
-                // start, so it takes everything queued at once (cached audio
-                // too: the voice does not change mid-reply)
-                let mut all = st.queue.drain(..);
-                let first = all.next().unwrap_or_else(|| Item::new("", false));
-                all.fold(Item { wav: None, ..first }, |mut acc, p| {
-                    acc.text = join_speech(&acc.text, &p.text);
-                    acc.reply |= p.reply;
-                    acc
-                })
+                // start, so it takes everything of the turn queued at once
+                // (cached audio too: the voice does not change mid-reply)
+                let first = st.queue.pop_front().unwrap_or_else(|| Item::new("", 0));
+                let mut chunk = Item { wav: None, ..first };
+                while let Some(p) = st.queue.front().filter(|p| p.turn == chunk.turn) {
+                    chunk.text = join_speech(&chunk.text, &p.text);
+                    st.queue.pop_front();
+                }
+                chunk
             } else {
                 // Grow gradually, so that each chunk's synthesis (a fixed overhead
                 // plus a share of its length) fits into the playback of the one
@@ -599,9 +615,11 @@ impl Speaker {
                 let limit = if first { CHUNK_GROW } else { ((r.last as f64 * growth) as usize).clamp(CHUNK_GROW, CHUNK_MAX) };
                 take_chunk(&mut st.queue, first, limit)
             };
+            let plan = Plan { say: r.say, lost: r.lost, lead: r.taken == 0 };
+            r.taken += 1;
             r.ahead += 1;
             r.last = chunk.text.chars().count();
-            return Next::Take(chunk, r.say);
+            return Next::Take(chunk, plan);
         }
         if !st.queue.is_empty() || r.ahead > 0 {
             return Next::Wait;
@@ -619,24 +637,26 @@ impl Speaker {
     }
 
     /// Turns one chunk into a clip. When AivisSpeech is not there the chunk
-    /// goes to `say`, unless the run already speaks with AivisSpeech; that
+    /// goes to `say`, unless the engine already made audio for the run; that
     /// chunk, and one the engine timed out on or rejected, is skipped, so the
     /// voice does not change mid-reply. A cached phrase needs no engine.
-    fn prepare(self: &Arc<Self>, id: u64, cancel: &Cancel, chunk: &Item, say: bool) -> Clip {
-        let note = Note { reply: chunk.reply, cached: false, asked: chunk.asked, synth: None };
+    fn prepare(self: &Arc<Self>, id: u64, cancel: &Cancel, chunk: &Item, plan: Plan) -> Clip {
+        let note = Note { turn: chunk.turn, cached: false, lead: plan.lead, asked: chunk.asked, synth: None };
         let text = chunk.text.as_str();
         let to_say = Clip { text: text.to_string(), note: Some(note.clone()), ..Clip::default() };
-        let Some(aivis) = self.aivis.as_ref().filter(|_| !say) else { return to_say };
+        // Nothing to play, but the latency log learns of it
+        let skipped = Clip { note: Some(note.clone()), ..Clip::default() };
+        let Some(aivis) = self.aivis.as_ref().filter(|_| !plan.say) else { return to_say };
         if let Some(wav) = &chunk.wav {
-            self.voiced(id, true);
             let pcm = self.player.as_ref().and_then(|_| wav_pcm(wav, pause_after(text)));
             return Clip { wav: Some(wav.clone()), pcm, text: text.to_string(), note: Some(Note { cached: true, ..note }) };
         }
-        if let Some(p) = &self.player {
-            aivis.rate.store(p.rate(), Ordering::SeqCst);
+        if plan.lost {
+            return skipped;
         }
+        let rate = self.player.as_ref().map_or(DEFAULT_RATE, |p| p.rate());
         let asked = Instant::now();
-        let res = aivis.synth(cancel, text);
+        let res = aivis.synth(cancel, text, rate);
         if cancel.is_cancelled() {
             return Clip::default();
         }
@@ -651,13 +671,13 @@ impl Speaker {
             Err(e) if e.unavailable() && !voiced => to_say,
             Err(e) => {
                 log(&format!("tts: skipped {:?}: {e}", excerpt(text)));
-                Clip::default()
+                skipped
             }
         }
     }
 
-    /// Records that the run has AivisSpeech audio now (got), and returns
-    /// whether it had some before.
+    /// Records that the engine made audio for the run now (got), and returns
+    /// whether it had before.
     fn voiced(&self, id: u64, got: bool) -> bool {
         let mut st = self.lock();
         match st.cur.as_mut().filter(|r| r.id == id) {
@@ -677,7 +697,6 @@ impl Speaker {
         let mut playing: VecDeque<bool> = VecDeque::new(); // oldest first; true = on the gapless player
         let mut held: VecDeque<Clip> = VecDeque::new(); // received, waiting for their turn
         let mut ended = false;
-        let mut sounded = false; // a clip of this run has started to sound
         loop {
             if cancel.is_cancelled() {
                 return;
@@ -693,8 +712,7 @@ impl Speaker {
             }
             match rx.recv_timeout(Duration::from_millis(50)) {
                 Ok(Ev::Clip(c)) => held.push_back(c),
-                Ok(Ev::Sounded(mut s)) => {
-                    s.first = !std::mem::replace(&mut sounded, true);
+                Ok(Ev::Sounded(s)) => {
                     if let Some(tap) = &self.tap {
                         tap(&s);
                     }
@@ -720,11 +738,11 @@ impl Speaker {
                 return false;
             }
             let (tx, started) = (heard.clone(), heard.clone());
-            let note = c.sounded(Instant::now());
+            let note = c.sounded(None);
             // Called from the device's callback, with its first sample
             let on_start = move || {
                 if let Some(mut s) = note {
-                    s.at = Instant::now();
+                    s.at = Some(Instant::now());
                     let _ = started.send(Ev::Sounded(s));
                 }
             };
@@ -744,19 +762,25 @@ impl Speaker {
         playing.push_back(false);
         let (s, c, cancel, tx) = (self.clone(), c.clone(), cancel.clone(), heard.clone());
         std::thread::spawn(move || {
-            if c.wav.is_some() || !c.text.is_empty() {
-                if let Some(sounded) = c.sounded(Instant::now()) {
-                    let _ = tx.send(Ev::Sounded(sounded));
-                }
+            // Told once it has played, as of its start: `say` and afplay do not
+            // tell when their sound begins, and one that failed never sounded
+            let at = Instant::now();
+            let played = (c.wav.is_some() || !c.text.is_empty()) && {
                 let res = match &s.play_fn {
                     Some(f) => f(&cancel, &c),
                     None => s.output(&cancel, &c),
                 };
-                if let Err(e) = res
+                if let Err(e) = &res
                     && !cancel.is_cancelled()
                 {
                     log(&format!("tts: {e}"));
                 }
+                res.is_ok()
+            };
+            if !cancel.is_cancelled()
+                && let Some(told) = c.sounded(played.then_some(at))
+            {
+                let _ = tx.send(Ev::Sounded(told));
             }
             let _ = tx.send(Ev::Heard);
         });
@@ -890,7 +914,7 @@ mod tests {
     }
 
     fn items(texts: &[&str]) -> VecDeque<Item> {
-        texts.iter().map(|t| Item::new(t, true)).collect()
+        texts.iter().map(|t| Item::new(t, 1)).collect()
     }
 
     #[test]
@@ -971,15 +995,27 @@ mod tests {
     fn cached_phrases_stand_alone() {
         let mut q = items(&["はい。", "確認です。", "次の文です。"]);
         q[1].wav = Some(test_wav(0.1, 24000));
-        q[1].reply = false;
+        q[1].turn = 0;
         let a = take_chunk(&mut q, false, CHUNK_MAX);
         assert_eq!((a.text.as_str(), a.wav.is_some()), ("はい。", false), "stops before the cached one");
         let b = take_chunk(&mut q, false, CHUNK_MAX);
-        assert_eq!((b.text.as_str(), b.wav.is_some(), b.reply), ("確認です。", true, false));
+        assert_eq!((b.text.as_str(), b.wav.is_some(), b.turn), ("確認です。", true, 0));
         let mut q = items(&["テストを実行したら、結果を確認します。"]);
         let asked = q[0].asked;
         take_chunk(&mut q, true, CHUNK_GROW);
-        assert!(q[0].reply && q[0].asked == asked);
+        assert!(q[0].turn == 1 && q[0].asked == asked);
+    }
+
+    /// The tail of one reply and the start of the next (typed while it was
+    /// still spoken) are not merged: the latency log times the new reply from
+    /// its own first chunk.
+    #[test]
+    fn replies_to_two_turns_do_not_merge() {
+        let mut q = items(&["前の返事の最後です。", "新しい返事です。"]);
+        q[1].turn = 2;
+        let a = take_chunk(&mut q, false, CHUNK_MAX);
+        assert_eq!((a.text.as_str(), a.turn), ("前の返事の最後です。", 1));
+        assert_eq!(take_chunk(&mut q, false, CHUNK_MAX).turn, 2);
     }
 
     /// A speaker whose output is recorded instead of played, and what it
@@ -1015,7 +1051,7 @@ mod tests {
     }
 
     fn ready(url: &str) -> Arc<AivisEngine> {
-        AivisEngine::with_timing(url, Duration::from_millis(400), Duration::from_secs(10))
+        AivisEngine::tuned(url, |a| a.timeout = Duration::from_millis(400))
     }
 
     #[test]
@@ -1052,9 +1088,44 @@ mod tests {
         let taps = taps.lock().unwrap();
         let what: Vec<(bool, bool, bool)> = taps.iter().map(|t| (t.cached, t.first, t.synth.is_some())).collect();
         assert_eq!(what, [(true, true, false), (false, false, true), (true, false, false)]);
-        assert!(taps.iter().all(|t| !t.reply && !t.say));
-        let soon = taps[0].at - taps[0].asked;
+        assert!(taps.iter().all(|t| t.turn == 0 && !t.say));
+        let soon = taps[0].at.unwrap() - taps[0].asked;
         assert!(soon < Duration::from_millis(100), "the cached phrase sounded after {soon:?}");
+    }
+
+    /// An engine that died unseen is found out by the first chunk it has to
+    /// make. A cached phrase before it shows nothing of the engine, so the
+    /// rest goes to `say` as it would have without the cache (the voice
+    /// changes once rather than the rest going unheard).
+    #[test]
+    fn a_dead_engine_after_a_cached_phrase_hands_the_rest_to_say() {
+        let phrases = Phrases::new(std::env::temp_dir().join("va-tts-unused"));
+        phrases.insert(CODE_NOTICE, test_wav(0.05, 44100));
+        let a = ready("http://127.0.0.1:1");
+        let (s, played, _) = tapped(Some(a.clone()), Some(phrases));
+        s.speak_reply(&format!("{CODE_NOTICE}残りの文です。"), 1);
+        wait_silent(&s);
+        assert_eq!(*played.lock().unwrap(), [format!("aivis:{CODE_NOTICE}"), "say:残りの文です。".to_string()]);
+        assert!(a.is_down());
+        a.stop();
+    }
+
+    /// While the engine is down, what the cache has plays on in its voice:
+    /// an approval whose sentences are all cached is heard whole.
+    #[test]
+    fn cached_phrases_play_while_the_engine_is_down() {
+        let phrases = Phrases::new(std::env::temp_dir().join("va-tts-unused"));
+        for t in ["確認です。", "リモートへ push します。", "実行していいですか？"] {
+            phrases.insert(t, test_wav(0.05, 44100));
+        }
+        let a = ready("http://127.0.0.1:1");
+        a.stop(); // no watcher, so it stays down
+        a.note(Some(&crate::speech::aivis::SynthError::Net("refused".into())));
+        assert!(a.is_down());
+        let (s, played, _) = tapped(Some(a), Some(phrases));
+        s.speak("確認です。リモートへ push します。実行していいですか？");
+        wait_silent(&s);
+        assert_eq!(*played.lock().unwrap(), ["aivis:確認です。", "aivis:リモートへ push します。", "aivis:実行していいですか？"]);
     }
 
     /// Without the engine everything goes to `say`, cached phrases too (the
@@ -1080,14 +1151,14 @@ mod tests {
     fn the_reply_is_told_apart() {
         let e = engine(|_| 200, |_| Duration::from_millis(20));
         let (s, _, taps) = tapped(Some(ready(&e.srv.url)), None);
-        s.speak_reply("返事の一文目です。");
+        assert!(s.speak_reply("返事の一文目です。", 7));
         wait_silent(&s);
         s.speak("お知らせです。");
         wait_silent(&s);
         let taps = taps.lock().unwrap();
-        assert_eq!(taps.iter().map(|t| (t.reply, t.first)).collect::<Vec<_>>(), [(true, true), (false, true)]);
+        assert_eq!(taps.iter().map(|t| (t.turn, t.first)).collect::<Vec<_>>(), [(7, true), (0, true)]);
         let syn = taps[0].synth.expect("synthesized");
-        assert!(taps[0].asked <= syn.asked && syn.asked <= syn.got && syn.got < syn.done && syn.done <= taps[0].at);
+        assert!(taps[0].asked <= syn.asked && syn.asked <= syn.got && syn.got < syn.done && syn.done <= taps[0].at.unwrap());
         assert!(syn.done - syn.got >= Duration::from_millis(20), "the engine took its time");
     }
 
@@ -1115,6 +1186,33 @@ mod tests {
         assert!(p.iter().all(|x| x.starts_with("aivis:")), "the voice must not change mid-reply: {p:?}");
         assert!(!p.concat().contains("だめ"));
         assert!(!a.is_down());
+    }
+
+    /// The latency log learns of a chunk that never sounded: one the engine
+    /// refused, and one `say` failed on (told once it has played, so a
+    /// failure is known). A cached phrase that waited behind a skipped chunk
+    /// does not count as the first of its run.
+    #[test]
+    fn what_never_sounded_is_told_too() {
+        let e = engine(|text| if text.contains("だめ") { 422 } else { 200 }, |_| Duration::ZERO);
+        let phrases = Phrases::new(std::env::temp_dir().join("va-tts-unused"));
+        phrases.insert("確認です。", test_wav(0.05, 44100));
+        let (s, _, taps) = tapped(Some(ready(&e.srv.url)), Some(phrases));
+        s.speak_reply("これはだめな文です。確認です。", 3);
+        wait_silent(&s);
+        let told: Vec<(u64, bool, bool, bool, bool)> = taps.lock().unwrap().iter().map(|t| (t.turn, t.cached, t.say, t.first, t.at.is_some())).collect();
+        assert_eq!(told, [(3, false, false, true, false), (3, true, false, false, true)]);
+
+        let failing = Arc::new(Mutex::new(Vec::new()));
+        let f = failing.clone();
+        let mut s = Speaker::new("Kyoko", 260, None, None, None, true, Box::new(|| {}));
+        s.play_fn = Some(Box::new(|_, _| Err("say: no such voice".into())));
+        s.tap = Some(Box::new(move |t| f.lock().unwrap().push(t.clone())));
+        let s = Arc::new(s);
+        s.speak_reply("読めない文です。", 4);
+        wait_silent(&s);
+        let told: Vec<(u64, bool, bool)> = failing.lock().unwrap().iter().map(|t| (t.turn, t.say, t.at.is_some())).collect();
+        assert_eq!(told, [(4, true, false)]);
     }
 
     #[test]

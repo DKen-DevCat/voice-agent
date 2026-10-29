@@ -1,16 +1,19 @@
 //! Who gets the speech engine, and when work nobody waits for may run.
 //!
-//! AivisSpeech synthesizes one request at a time and cannot stop one once it
-//! has begun, so whoever holds the engine makes everyone else wait. The engine
-//! goes to the waiting request of the highest priority: speech the user is
-//! waiting to hear, then a phrase for the cache, then a warm-up. A request
-//! that holds the engine is never preempted; that is why warm-ups are short
-//! (aivis.rs) and the cache is built only while nothing goes on (phrases.rs).
+//! AivisSpeech cannot stop a synthesis once it has begun, and two at once
+//! would share the machine (or wait inside the engine, out of our sight), so
+//! whoever holds the engine makes everyone else wait. The engine goes to the
+//! waiting request of the highest priority: speech the user is waiting to
+//! hear, then a phrase for the cache, then a warm-up. A request that holds
+//! the engine is never preempted; that is why warm-ups are short (aivis.rs)
+//! and the cache is built only while nothing goes on (phrases.rs).
 //!
 //! Work nobody waits for also yields to the rest of an 8 GB M1, where whisper,
 //! AivisSpeech and Claude Code compete for memory and cores: no warm-up while
 //! whisper transcribes or a subagent works, no cache building unless all is
-//! quiet.
+//! quiet. Such work stands in line only while it may run, so a phrase for the
+//! cache that waits for quiet neither gets the engine meanwhile nor keeps a
+//! warm-up out.
 
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant};
@@ -72,13 +75,23 @@ impl Arbiter {
         self.st.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    /// What else is going on now (nothing, until the app tells).
+    pub fn now(&self) -> Activity {
+        self.activity.get().map(|f| f()).unwrap_or_default()
+    }
+
     /// Whether work of this kind may start now. Speech always may.
     pub fn may(&self, u: Use) -> bool {
-        let a = self.activity.get().map(|f| f()).unwrap_or_default();
         match u {
             Use::Speech => true,
-            Use::Warm => !a.transcribing && !a.agents,
-            Use::Cache => !a.transcribing && !a.agents && !a.busy,
+            Use::Warm => {
+                let a = self.now();
+                !a.transcribing && !a.agents
+            }
+            Use::Cache => {
+                let a = self.now();
+                !a.transcribing && !a.agents && !a.busy
+            }
         }
     }
 
@@ -98,28 +111,42 @@ impl Arbiter {
         self.lock().waiting[u as usize]
     }
 
-    /// Takes the engine once nobody holds it and nobody of a higher priority
-    /// waits for it.
+    /// Takes the engine once nobody holds it, nobody of a higher priority
+    /// waits for it and the work may run. A stopped request does not take it.
     pub fn acquire(self: &Arc<Self>, u: Use, cancel: &Cancel, timeout: Duration) -> Result<Grant, SynthError> {
         let deadline = Instant::now() + timeout;
-        let mut st = self.lock();
-        st.waiting[u as usize] += 1;
+        let mut in_line = false;
         let res = loop {
+            // Asked outside the lock: the app answers from behind locks of its own
+            let may = self.may(u);
+            let mut st = self.lock();
+            if may != in_line {
+                if may {
+                    st.waiting[u as usize] += 1;
+                } else {
+                    st.waiting[u as usize] -= 1;
+                }
+                in_line = may;
+            }
             let outranked = st.waiting[u as usize + 1..].iter().any(|&n| n > 0);
-            if st.held.is_none() && !outranked {
+            let res = if cancel.is_cancelled() {
+                Some(Err(SynthError::Cancelled))
+            } else if may && st.held.is_none() && !outranked {
                 st.held = Some(u);
-                break Ok(());
+                Some(Ok(()))
+            } else if Instant::now() >= deadline {
+                Some(Err(SynthError::Timeout))
+            } else {
+                None
+            };
+            if let Some(res) = res {
+                if in_line {
+                    st.waiting[u as usize] -= 1;
+                }
+                break res;
             }
-            if cancel.is_cancelled() {
-                break Err(SynthError::Cancelled);
-            }
-            if Instant::now() >= deadline {
-                break Err(SynthError::Timeout);
-            }
-            st = self.cond.wait_timeout(st, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()).0;
+            drop(self.cond.wait_timeout(st, Duration::from_millis(50)).unwrap_or_else(|e| e.into_inner()));
         };
-        st.waiting[u as usize] -= 1;
-        drop(st);
         match res {
             Ok(()) => Ok(Grant(self.clone())),
             Err(e) => {
@@ -194,9 +221,38 @@ mod tests {
         assert_eq!(arb.acquire(Use::Speech, &cancel, Duration::from_secs(1)).err(), Some(SynthError::Cancelled));
         assert_eq!(arb.lock().waiting, [0, 0, 0]);
         drop(held);
+        assert_eq!(
+            arb.acquire(Use::Speech, &cancel, Duration::from_secs(1)).err(),
+            Some(SynthError::Cancelled),
+            "a stopped request does not take a free engine"
+        );
+        assert_eq!(arb.held(), None);
         let t0 = Instant::now();
         drop(arb.acquire(Use::Warm, &Cancel::new(), Duration::from_secs(1)).unwrap());
         assert!(t0.elapsed() < Duration::from_millis(100), "free again");
+    }
+
+    /// Work that may not run now stays out of the line: a phrase for the
+    /// cache that waits for quiet does not get the engine meanwhile (not even
+    /// when it comes free), nor does it keep a warm-up out.
+    #[test]
+    fn only_work_that_may_run_stands_in_line() {
+        let arb = Arbiter::new();
+        let now = Arc::new(Mutex::new(Activity { busy: true, ..Activity::default() }));
+        let n = now.clone();
+        let _ = arb.activity.set(Box::new(move || *n.lock().unwrap()));
+        let held = arb.acquire(Use::Speech, &Cancel::new(), Duration::from_secs(1)).unwrap();
+        let (tx, rx) = mpsc::channel();
+        let cache = wait_for(&arb, Use::Cache, Duration::ZERO, &tx);
+        std::thread::sleep(Duration::from_millis(150));
+        drop(held);
+        std::thread::sleep(Duration::from_millis(150));
+        assert!(rx.try_recv().is_err(), "the user is talking");
+        assert_eq!(arb.waiting(Use::Cache), 0);
+        drop(arb.acquire(Use::Warm, &Cancel::new(), Duration::from_millis(500)).expect("a warm-up may go"));
+        *now.lock().unwrap() = Activity::default();
+        assert_eq!(rx.recv_timeout(Duration::from_secs(5)).unwrap(), Use::Cache);
+        cache.join().unwrap();
     }
 
     #[test]

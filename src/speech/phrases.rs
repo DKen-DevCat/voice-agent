@@ -2,15 +2,18 @@
 //! commands, the error notice), synthesized while nothing else goes on and
 //! kept on disk, so that it plays at once instead of waiting for the engine.
 //!
-//! A clip is good for one voice: the engine's version, the style, the speed
-//! and the sample rate it was made at go into its file name, and the files of
-//! other voices are removed when the cache is built.
+//! A clip is good for one voice: the engine's version, the style, the speed,
+//! the synthesis settings and the sample rate it was made at go into its file
+//! name, and the files of other voices are removed when the cache is built.
+//! Clips are made at AivisSpeech's own rate whatever the output device, and
+//! the player converts them for a device at another rate, so another device
+//! does not make the cache anew.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use super::aivis::AivisEngine;
 use super::arbiter::Use;
@@ -21,6 +24,13 @@ use crate::util::{private_dir, write_private};
 
 /// How often a build that waits for a quiet moment looks again.
 const POLL: Duration = Duration::from_millis(250);
+/// The rate clips are made at: AivisSpeech's own (its engine_manifest.json
+/// says default_sampling_rate 44100), which it makes without converting.
+pub const RATE: u32 = 44100;
+/// A phrase the engine failed on is tried again after this, TRIES times in
+/// all: a timeout on an engine paged out, say, need not last.
+const RETRY_AFTER: Duration = Duration::from_secs(60);
+const TRIES: usize = 3;
 
 #[derive(Default)]
 struct State {
@@ -32,7 +42,8 @@ pub struct Phrases {
     dir: PathBuf,
     st: Mutex<State>,
     building: AtomicBool,
-    cancel: Cancel, // close: a build stops
+    cancel: Cancel,        // close: a build stops
+    retry_after: Duration, // see RETRY_AFTER
 }
 
 /// A file name from a text: 64-bit FNV-1a, which stays the same across Rust
@@ -57,7 +68,13 @@ fn playable(wav: &[u8]) -> bool {
 
 impl Phrases {
     pub fn new(dir: PathBuf) -> Arc<Phrases> {
-        Arc::new(Phrases { dir, st: Mutex::default(), building: AtomicBool::new(false), cancel: Cancel::new() })
+        Arc::new(Phrases { dir, st: Mutex::default(), building: AtomicBool::new(false), cancel: Cancel::new(), retry_after: RETRY_AFTER })
+    }
+
+    #[cfg(test)]
+    fn retrying_after(dir: PathBuf, retry_after: Duration) -> Arc<Phrases> {
+        let p = Phrases::new(dir);
+        Arc::new(Phrases { retry_after, ..Arc::try_unwrap(p).unwrap_or_else(|_| unreachable!()) })
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -80,29 +97,29 @@ impl Phrases {
         self.lock().clips.len()
     }
 
-    /// Loads what is on disk for the engine's voice at rate, and synthesizes
-    /// the rest in the background, one phrase at a time and only while the
-    /// arbiter allows it (Use::Cache). Does nothing while a build runs.
-    pub fn build(self: &Arc<Self>, engine: &Arc<AivisEngine>, rate: u32, texts: Vec<String>) {
+    /// Loads what is on disk for the engine's voice, and synthesizes the rest
+    /// in the background, one phrase at a time and only while the arbiter
+    /// allows it (Use::Cache). Does nothing while a build runs.
+    pub fn build(self: &Arc<Self>, engine: &Arc<AivisEngine>, texts: Vec<String>) {
         if self.building.swap(true, Ordering::SeqCst) {
             return;
         }
         let (p, engine) = (self.clone(), engine.clone());
         std::thread::spawn(move || {
-            let res = p.build_now(&engine, rate, &texts);
+            let res = p.build_now(&engine, &texts);
             p.building.store(false, Ordering::SeqCst);
             match res {
-                Ok((loaded, made)) => log(&format!("phrases: {loaded} from disk, {made} synthesized")),
+                Ok((loaded, made, 0)) => log(&format!("phrases: {loaded} from disk, {made} synthesized")),
+                Ok((loaded, made, failed)) => log(&format!("phrases: {loaded} from disk, {made} synthesized, {failed} not made")),
                 Err(e) => log(&format!("phrases: {e}")),
             }
         });
     }
 
-    /// (loaded from disk, synthesized)
-    fn build_now(&self, engine: &Arc<AivisEngine>, rate: u32, texts: &[String]) -> Result<(usize, usize), String> {
+    /// (loaded from disk, synthesized, not made)
+    fn build_now(&self, engine: &Arc<AivisEngine>, texts: &[String]) -> Result<(usize, usize, usize), String> {
         let version = engine.version().ok_or("the engine did not tell its version")?;
-        let (speaker, speed) = engine.voice();
-        let voice = format!("{version}\n{speaker}\n{speed}\n{rate}");
+        let voice = format!("{version}\n{}\n{RATE}", engine.voice());
         private_dir(&self.dir).map_err(|e| format!("{}: {e}", self.dir.display()))?;
         let files: Vec<(&String, PathBuf)> = texts.iter().map(|t| (t, self.dir.join(file_name(&voice, t)))).collect();
         self.prune(&files);
@@ -113,46 +130,93 @@ impl Phrases {
                 st.voice = voice.clone();
             }
         }
-        let (mut loaded, mut made) = (0, 0);
+        // All that is on disk first: a phrase the engine fails on keeps none
+        // of the others from being read
+        let mut loaded = 0;
+        let mut missing = Vec::new();
         for (text, path) in files {
             if self.lock().clips.contains_key(text) {
                 continue;
             }
-            if let Ok(wav) = std::fs::read(&path)
-                && playable(&wav)
-            {
-                self.lock().clips.insert(text.clone(), wav);
-                loaded += 1;
-                continue;
+            match std::fs::read(&path) {
+                Ok(wav) if playable(&wav) => {
+                    self.lock().clips.insert(text.clone(), wav);
+                    loaded += 1;
+                }
+                _ => missing.push((text, path)),
             }
-            self.wait_quiet(engine)?;
-            engine.rate.store(rate, Ordering::SeqCst);
-            let wav = engine.synth_as(Use::Cache, &self.cancel, text).map_err(|e| format!("{text}: {e}"))?.wav;
-            if !playable(&wav) {
-                return Err(format!("{text}: not 16-bit mono audio"));
-            }
-            // Written whole or not at all: a file cut short would not play
-            let tmp = path.with_extension("tmp");
-            write_private(&tmp, &wav).and_then(|()| std::fs::rename(&tmp, &path)).map_err(|e| format!("{}: {e}", path.display()))?;
-            self.lock().clips.insert(text.clone(), wav);
-            made += 1;
         }
-        Ok((loaded, made))
+        let mut made = 0;
+        for round in 0..TRIES {
+            if missing.is_empty() {
+                break;
+            }
+            if round > 0 {
+                self.pause(engine, self.retry_after)?;
+            }
+            let mut failed = Vec::new();
+            for (text, path) in missing {
+                self.wait_quiet(engine)?;
+                match self.make(engine, text, &path) {
+                    Ok(()) => made += 1,
+                    Err(_) if self.cancel.is_cancelled() => return Err("stopped".into()),
+                    Err(e) => {
+                        log(&format!("phrases: {text}: {e}"));
+                        failed.push((text, path));
+                    }
+                }
+            }
+            missing = failed;
+        }
+        Ok((loaded, made, missing.len()))
+    }
+
+    /// Synthesizes text and keeps it, on disk at path too.
+    fn make(&self, engine: &Arc<AivisEngine>, text: &str, path: &Path) -> Result<(), String> {
+        let wav = engine.synth_as(Use::Cache, &self.cancel, text, RATE).map_err(|e| e.to_string())?.wav;
+        if !playable(&wav) {
+            return Err("not 16-bit mono audio".into());
+        }
+        // Written whole or not at all: a file cut short would not play
+        let tmp = path.with_extension("tmp");
+        write_private(&tmp, &wav).and_then(|()| std::fs::rename(&tmp, path)).map_err(|e| format!("{}: {e}", path.display()))?;
+        self.lock().clips.insert(text.to_string(), wav);
+        Ok(())
+    }
+
+    /// Whether the build may go on: not once the app closes or the engine
+    /// goes away (its return builds the cache again).
+    fn go_on(&self, engine: &AivisEngine) -> Result<(), String> {
+        if self.cancel.is_cancelled() || engine.is_closed() {
+            return Err("stopped".into());
+        }
+        if engine.is_down() {
+            return Err("the engine went away".into());
+        }
+        Ok(())
     }
 
     /// Waits until the engine may be used for the cache.
     fn wait_quiet(&self, engine: &AivisEngine) -> Result<(), String> {
         loop {
-            if self.cancel.is_cancelled() || engine.is_closed() {
-                return Err("stopped".into());
-            }
-            if engine.is_down() {
-                return Err("the engine went away".into());
-            }
+            self.go_on(engine)?;
             if engine.arbiter.may(Use::Cache) {
                 return Ok(());
             }
             std::thread::sleep(POLL);
+        }
+    }
+
+    /// Waits d before trying again.
+    fn pause(&self, engine: &AivisEngine, d: Duration) -> Result<(), String> {
+        let until = Instant::now() + d;
+        loop {
+            self.go_on(engine)?;
+            let left = until.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return Ok(());
+            }
+            std::thread::sleep(left.min(POLL));
         }
     }
 
@@ -210,10 +274,10 @@ mod tests {
         let a = AivisEngine::new(&e.srv.url, 1, 1.3);
         let dir = temp_dir("disk");
         let p = Phrases::new(dir.clone());
-        p.build(&a, 24000, texts());
+        p.build(&a, texts());
         wait_built(&p, 3);
         assert_eq!(*e.synths.lock().unwrap(), texts());
-        assert!(e.bodies.lock().unwrap().iter().all(|b| b["outputSamplingRate"] == 24000), "made at the rate asked for");
+        assert!(e.bodies.lock().unwrap().iter().all(|b| b["outputSamplingRate"] == RATE), "made at AivisSpeech's own rate");
         assert!(p.get("確認です。").is_some_and(|w| playable(&w)));
         assert!(p.get("ほかの文。").is_none());
         let files: Vec<_> = std::fs::read_dir(&dir).unwrap().flatten().collect();
@@ -222,32 +286,33 @@ mod tests {
         assert!(files.iter().all(|f| f.metadata().unwrap().permissions().mode() & 0o077 == 0), "only the user can read them");
 
         let again = Phrases::new(dir.clone());
-        again.build(&a, 24000, texts());
+        again.build(&a, texts());
         wait_built(&again, 3);
         assert_eq!(e.synths.lock().unwrap().len(), 3, "nothing synthesized again");
         assert_eq!(again.get("確認です。"), p.get("確認です。"));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Another voice (here another rate) is made anew and the old files go;
-    /// a damaged file is made again.
+    /// Another voice (here another style) is made anew and the old files go;
+    /// a damaged file is made again. (Before, another output rate also made
+    /// the cache anew; now clips are made at one rate.)
     #[test]
     fn another_voice_is_made_anew() {
         let e = engine(|_| 200, |_| Duration::ZERO);
-        let a = AivisEngine::new(&e.srv.url, 1, 1.3);
+        let (a, b) = (AivisEngine::new(&e.srv.url, 1, 1.3), AivisEngine::new(&e.srv.url, 2, 1.3));
         let dir = temp_dir("voice");
         let p = Phrases::new(dir.clone());
-        p.build(&a, 24000, texts());
+        p.build(&a, texts());
         wait_built(&p, 3);
-        p.build(&a, 48000, texts());
+        p.build(&b, texts());
         wait_built(&p, 3);
         assert_eq!(e.synths.lock().unwrap().len(), 6);
-        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "the 24 kHz files are gone");
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 3, "the first style's files are gone");
 
         let one = std::fs::read_dir(&dir).unwrap().flatten().next().unwrap().path();
         std::fs::write(&one, b"RIFF").unwrap();
         let fresh = Phrases::new(dir.clone());
-        fresh.build(&a, 48000, texts());
+        fresh.build(&b, texts());
         wait_built(&fresh, 3);
         assert_eq!(e.synths.lock().unwrap().len(), 7, "only the damaged one");
         let _ = std::fs::remove_dir_all(&dir);
@@ -263,7 +328,7 @@ mod tests {
         let _ = a.arbiter.activity.set(Box::new(move || Activity { busy: b.load(Ordering::SeqCst), ..Activity::default() }));
         let dir = temp_dir("quiet");
         let p = Phrases::new(dir.clone());
-        p.build(&a, 24000, texts());
+        p.build(&a, texts());
         std::thread::sleep(Duration::from_millis(600));
         assert!(e.synths.lock().unwrap().is_empty(), "the user is talking");
         busy.store(false, Ordering::SeqCst);
@@ -271,7 +336,7 @@ mod tests {
 
         let stopped = Phrases::new(temp_dir("stopped"));
         busy.store(true, Ordering::SeqCst);
-        stopped.build(&a, 16000, texts());
+        stopped.build(&a, texts());
         stopped.stop();
         let deadline = Instant::now() + Duration::from_secs(5);
         while stopped.building.load(Ordering::SeqCst) {
@@ -281,6 +346,50 @@ mod tests {
         assert_eq!(stopped.ready(), 0);
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(temp_dir("stopped"));
+    }
+
+    /// A phrase the engine fails on keeps none of the others from being made
+    /// or read, and is tried again later; one it always refuses is left out
+    /// after TRIES tries.
+    #[test]
+    fn a_failed_phrase_is_tried_again() {
+        use std::sync::atomic::AtomicUsize;
+        let tries = Arc::new(AtomicUsize::new(0));
+        let t = tries.clone();
+        let e = engine(
+            move |text| match text {
+                "確認です。" if t.fetch_add(1, Ordering::SeqCst) == 0 => 500,
+                "マイクを切りました。" => 422,
+                _ => 200,
+            },
+            |_| Duration::ZERO,
+        );
+        let a = AivisEngine::new(&e.srv.url, 1, 1.3);
+        let dir = temp_dir("retry");
+        let p = Phrases::retrying_after(dir.clone(), Duration::from_millis(50));
+        p.build(&a, texts());
+        wait_built(&p, 2);
+        assert!(p.get("確認です。").is_some() && p.get("実行していいですか？").is_some());
+        assert!(p.get("マイクを切りました。").is_none());
+        assert_eq!(tries.load(Ordering::SeqCst), 2, "made on the second try");
+        let refused = e.bodies.lock().unwrap().iter().filter(|b| b["kana"] == "マイクを切りました。").count();
+        assert_eq!(refused, TRIES);
+
+        // The next start reads the two from disk and tries the third again
+        let again = Phrases::retrying_after(dir.clone(), Duration::from_millis(50));
+        again.build(&a, texts());
+        wait_built(&again, 2);
+        assert_eq!(e.synths.lock().unwrap().len(), 2, "nothing made again");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// docs/design.md's account of P1 gives the cache's numbers.
+    #[test]
+    fn the_design_doc_has_the_cache() {
+        let p1 = include_str!("../../docs/design.md").split("## P1 で").nth(1).unwrap().split("\n## ").next().unwrap();
+        for want in [format!("{RATE} Hz"), format!("{} 秒後に、{TRIES} 回まで", RETRY_AFTER.as_secs())] {
+            assert!(p1.contains(&want), "the P1 section should say {want:?}");
+        }
     }
 
     #[test]

@@ -6,7 +6,6 @@
 
 use std::io::{BufRead, BufReader};
 use std::process::{ChildStdin, Command, Stdio};
-use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, mpsc};
 use std::time::{Duration, Instant};
 
@@ -30,14 +29,16 @@ const WARM_TIMEOUT: Duration = Duration::from_secs(120);
 /// How long the engine counts as warm after it last synthesized: a warm-up
 /// within this time of speech is left out.
 const WARM_EVERY: Duration = Duration::from_secs(10);
-/// How long a warm-up waits for whisper and the subagents to finish before
-/// it is given up: by then the reply it was for is usually being spoken.
-const WARM_WAIT: Duration = Duration::from_secs(30);
 /// How often a warm-up that waits looks again.
 const WARM_POLL: Duration = Duration::from_millis(200);
 /// Synthesized to get the voice model resident. Short, because a synthesis
 /// cannot be stopped: speech that comes up meanwhile waits for it.
 const WARM_TEXT: &str = "はい。";
+// Chunks follow each other directly: no lead-in, a short tail, and tighter
+// pauses inside a chunk to match the faster speed
+const PRE_PHONEME: f64 = 0.0;
+const POST_PHONEME: f64 = 0.05;
+const PAUSE_SCALE: f64 = 0.7;
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum SynthError {
@@ -99,19 +100,21 @@ pub struct AivisEngine {
     speed: f64,
     pub timeout: Duration, // per chunk wait
     pub every: Duration,   // see WARM_EVERY
-    pub wait: Duration,    // see WARM_WAIT
     /// Hands out the engine: speech first, then the cache, then warm-ups
     pub arbiter: Arc<Arbiter>,
     /// Called each time the engine is up and warm (at the start, and when it
     /// is back after being down): the phrase cache is built then
     pub on_ready: OnceLock<Box<dyn Fn() + Send + Sync>>,
-    /// The sample rate asked for (the output device's)
-    pub rate: AtomicU32,
     st: Mutex<State>,
 }
 
-/// The engine inside AivisSpeech.app (None = not installed).
+/// The engine inside AivisSpeech.app (None = not installed). Tests never
+/// start it: checks run without AivisSpeech (CLAUDE.md), and a stand-in slow
+/// to answer must not make one start on a busy 8 GB machine.
 fn engine_bin() -> Option<std::path::PathBuf> {
+    if cfg!(test) {
+        return None;
+    }
     [std::path::PathBuf::from("/Applications"), home_dir().join("Applications")]
         .into_iter()
         .map(|apps| apps.join("AivisSpeech.app/Contents/Resources/AivisSpeech-Engine/run"))
@@ -126,19 +129,9 @@ impl AivisEngine {
             speed,
             timeout: CHUNK_TIMEOUT,
             every: WARM_EVERY,
-            wait: WARM_WAIT,
             arbiter: Arbiter::new(),
             on_ready: OnceLock::new(),
-            rate: AtomicU32::new(DEFAULT_RATE),
             st: Mutex::new(State::default()),
-        })
-    }
-
-    #[cfg(test)]
-    pub fn with_timing(url: &str, timeout: Duration, every: Duration) -> Arc<AivisEngine> {
-        AivisEngine::tuned(url, |a| {
-            a.timeout = timeout;
-            a.every = every;
         })
     }
 
@@ -149,9 +142,11 @@ impl AivisEngine {
         Arc::new(a)
     }
 
-    /// The style and the speed, which the phrase cache is made for.
-    pub fn voice(&self) -> (i64, f64) {
-        (self.speaker, self.speed)
+    /// What shapes the audio besides the engine's version and the rate: the
+    /// style, the speed and the synthesis settings. The phrase cache is made
+    /// for it.
+    pub fn voice(&self) -> String {
+        format!("style {} speed {} pre {PRE_PHONEME} post {POST_PHONEME} pauses {PAUSE_SCALE}", self.speaker, self.speed)
     }
 
     fn lock(&self) -> MutexGuard<'_, State> {
@@ -265,7 +260,7 @@ impl AivisEngine {
     fn warm_up(&self) -> Result<(), SynthError> {
         let _grant = self.arbiter.acquire(Use::Warm, &Cancel::new(), WARM_TIMEOUT)?;
         self.post(&format!("/initialize_speaker?speaker={}&skip_reinit=true", self.speaker), None, WARM_TIMEOUT)?;
-        self.request(WARM_TEXT, WARM_TIMEOUT)?;
+        self.request(WARM_TEXT, WARM_TIMEOUT, DEFAULT_RATE, &Cancel::new())?;
         self.lock().warm_at = Some(Instant::now());
         Ok(())
     }
@@ -276,13 +271,15 @@ impl AivisEngine {
     /// times slower than playback until it is back in.
     ///
     /// The warm-up waits while whisper transcribes, a subagent works (the
-    /// arbiter says when) or speech wants the engine. It is left out once the
-    /// engine has synthesized within `every`, or after `wait`; a newer call
-    /// takes the place of one still waiting.
+    /// arbiter says when) or speech wants the engine, for as long as a reply
+    /// may still come (Activity::busy): it runs as soon as a long subagent is
+    /// done. It is left out once the engine has synthesized within `every`,
+    /// or once nothing goes on any more; a newer call takes the place of one
+    /// still waiting.
     pub fn warm_once(self: &Arc<Self>) {
         let seq = {
             let mut st = self.lock();
-            if st.down || st.closed {
+            if st.down || st.closed || !warm_left(&st, self.every).is_zero() {
                 return;
             }
             st.warm_seq += 1;
@@ -290,7 +287,6 @@ impl AivisEngine {
         };
         let a = self.clone();
         std::thread::spawn(move || {
-            let until = Instant::now() + a.wait;
             loop {
                 {
                     let st = a.lock();
@@ -298,11 +294,11 @@ impl AivisEngine {
                         return;
                     }
                 }
+                if !a.arbiter.now().busy {
+                    return; // no reply is on its way
+                }
                 if a.arbiter.may(Use::Warm) && !a.arbiter.speech_wanted() {
                     break;
-                }
-                if Instant::now() >= until {
-                    return log("aivis: warm-up left out: whisper or a subagent was at work");
                 }
                 std::thread::sleep(WARM_POLL);
             }
@@ -322,7 +318,7 @@ impl AivisEngine {
         if !warm_left(&self.lock(), self.every).is_zero() {
             return Ok(false);
         }
-        self.request(WARM_TEXT, WARM_TIMEOUT)?;
+        self.request(WARM_TEXT, WARM_TIMEOUT, DEFAULT_RATE, &Cancel::new())?;
         self.lock().warm_at = Some(Instant::now());
         Ok(true)
     }
@@ -337,27 +333,33 @@ impl AivisEngine {
         self.lock().closed
     }
 
-    /// Returns WAV audio for one chunk of speech (and how long it waited for
-    /// the engine), or Timeout when the engine has not delivered it within two
-    /// chunk timeouts.
-    pub fn synth(self: &Arc<Self>, cancel: &Cancel, text: &str) -> Result<Synth, SynthError> {
-        self.synth_as(Use::Speech, cancel, text)
+    /// Returns WAV audio at rate for one chunk of speech (and how long it
+    /// waited for the engine), or Timeout when it has not come within two
+    /// chunk timeouts, the wait for the engine included.
+    pub fn synth(self: &Arc<Self>, cancel: &Cancel, text: &str, rate: u32) -> Result<Synth, SynthError> {
+        self.synth_as(Use::Speech, cancel, text, rate)
     }
 
-    /// synth for u, which decides who goes first (arbiter.rs).
-    pub fn synth_as(self: &Arc<Self>, u: Use, cancel: &Cancel, text: &str) -> Result<Synth, SynthError> {
-        let t0 = Instant::now();
-        let grant = self.arbiter.acquire(u, cancel, Duration::from_secs(3600))?;
-        let waited = t0.elapsed();
+    /// synth for u, which decides who goes first (arbiter.rs). Speech counts
+    /// its wait for the engine in its two chunk timeouts, so that an engine
+    /// stuck on an earlier request hands speech to `say` as soon as one stuck
+    /// on this chunk would; work nobody waits for waits for the engine as
+    /// long as it takes, and has the two timeouts from when it gets it.
+    pub fn synth_as(self: &Arc<Self>, u: Use, cancel: &Cancel, text: &str, rate: u32) -> Result<Synth, SynthError> {
         let wait = self.timeout;
+        let t0 = Instant::now();
+        let speech = u == Use::Speech;
+        let grant = self.arbiter.acquire(u, cancel, if speech { wait * 2 } else { Duration::from_secs(3600) })?;
         let t1 = Instant::now();
+        let from = if speech { t0 } else { t1 };
         // The request runs on a thread of its own so that a stop does not have
         // to wait for it. The engine stays taken until the request is over,
-        // since AivisSpeech goes on with it anyway
+        // since AivisSpeech goes on with it anyway; one stopped before its
+        // synthesis began ends there
         let (tx, rx) = mpsc::channel();
-        let (a, t) = (self.clone(), text.to_string());
+        let (a, t, c) = (self.clone(), text.to_string(), cancel.clone());
         std::thread::spawn(move || {
-            let res = a.request(&t, wait * 2 + Duration::from_secs(1));
+            let res = a.request(&t, wait * 2 + Duration::from_secs(1), rate, &c);
             if res.is_ok() {
                 // Speech keeps the engine warm by itself; recorded before the
                 // engine is let go, so that a warm-up waiting for it sees it
@@ -376,7 +378,7 @@ impl AivisEngine {
             if cancel.is_cancelled() {
                 break Err(SynthError::Cancelled);
             }
-            let taking = t1.elapsed();
+            let taking = from.elapsed();
             if taking >= wait * 2 {
                 break Err(SynthError::Timeout);
             }
@@ -391,7 +393,7 @@ impl AivisEngine {
                 self.lock().pace = t1.elapsed().as_secs_f64() / audio;
             }
         }
-        res.map(|wav| Synth { wav, waited })
+        res.map(|wav| Synth { wav, waited: t1 - t0 })
     }
 
     /// How many times longer than the last chunk the next one may be and
@@ -403,20 +405,23 @@ impl AivisEngine {
         if pace <= 0.0 { 2.0 } else { (1.0 / pace).clamp(1.0, 2.0) }
     }
 
-    /// audio_query + synthesis for text.
-    fn request(&self, text: &str, timeout: Duration) -> Result<Vec<u8>, SynthError> {
+    /// audio_query + synthesis for text at rate. One stopped (cancel) by the
+    /// time the query is back is not synthesized: that would hold the engine
+    /// for audio nobody hears.
+    fn request(&self, text: &str, timeout: Duration, rate: u32, cancel: &Cancel) -> Result<Vec<u8>, SynthError> {
         let data = self.post(&format!("/audio_query?speaker={}&text={}", self.speaker, net::query_escape(text)), None, timeout)?;
         let mut query: Value = serde_json::from_slice(&data).map_err(|e| SynthError::Net(e.to_string()))?;
         let Some(q) = query.as_object_mut() else { return Err(SynthError::Net("audio_query: not an object".into())) };
         q.insert("speedScale".into(), self.speed.into());
-        // Chunks follow each other directly: no lead-in, a short tail, and
-        // tighter pauses inside a chunk to match the faster speed
-        q.insert("prePhonemeLength".into(), 0.0.into());
-        q.insert("postPhonemeLength".into(), 0.05.into());
-        q.insert("pauseLengthScale".into(), 0.7.into());
-        q.insert("outputSamplingRate".into(), self.rate.load(Ordering::SeqCst).into());
+        q.insert("prePhonemeLength".into(), PRE_PHONEME.into());
+        q.insert("postPhonemeLength".into(), POST_PHONEME.into());
+        q.insert("pauseLengthScale".into(), PAUSE_SCALE.into());
+        q.insert("outputSamplingRate".into(), rate.into());
         q.insert("outputStereo".into(), false.into());
         let body = serde_json::to_vec(&query).map_err(|e| SynthError::Net(e.to_string()))?;
+        if cancel.is_cancelled() {
+            return Err(SynthError::Cancelled);
+        }
         self.post(&format!("/synthesis?speaker={}", self.speaker), Some(&body), timeout)
     }
 
@@ -510,6 +515,8 @@ pub mod testing {
     /// The audio of a text is 10 ms per character and takes delay(text) to
     /// synthesize; status(text) other than 200 refuses it.
     pub struct Engine {
+        /// The texts whose audio_query came in, in order
+        pub queries: Arc<Mutex<Vec<String>>>,
         /// What was synthesized, in the order it was finished
         pub synths: Arc<Mutex<Vec<String>>>,
         /// The synthesis requests' bodies
@@ -518,17 +525,29 @@ pub mod testing {
     }
 
     pub fn engine(status: impl Fn(&str) -> u16 + Send + Sync + 'static, delay: impl Fn(&str) -> Duration + Send + Sync + 'static) -> Engine {
+        engine_with(status, delay, |_| Duration::ZERO)
+    }
+
+    /// engine, whose audio_query of a text takes query(text).
+    pub fn engine_with(
+        status: impl Fn(&str) -> u16 + Send + Sync + 'static,
+        delay: impl Fn(&str) -> Duration + Send + Sync + 'static,
+        query: impl Fn(&str) -> Duration + Send + Sync + 'static,
+    ) -> Engine {
+        let queries = Arc::new(Mutex::new(Vec::new()));
         let synths = Arc::new(Mutex::new(Vec::new()));
         let bodies = Arc::new(Mutex::new(Vec::new()));
-        let (s, b) = (synths.clone(), bodies.clone());
+        let (qs, s, b) = (queries.clone(), synths.clone(), bodies.clone());
         let srv = serve(move |r: &Request| {
             let path = r.url.split('?').next().unwrap_or("");
             match path {
                 "/version" => (200, format!("\"{VERSION}\"").into_bytes()),
                 "/initialize_speaker" => (204, Vec::new()),
                 "/audio_query" => {
-                    let text = r.url.split("text=").nth(1).unwrap_or("").split('&').next().unwrap_or("");
-                    (200, serde_json::to_vec(&serde_json::json!({"kana": percent_decode(text), "speedScale": 1.0})).unwrap())
+                    let text = percent_decode(r.url.split("text=").nth(1).unwrap_or("").split('&').next().unwrap_or(""));
+                    qs.lock().unwrap().push(text.clone());
+                    std::thread::sleep(query(&text));
+                    (200, serde_json::to_vec(&serde_json::json!({"kana": text, "speedScale": 1.0})).unwrap())
                 }
                 "/synthesis" => {
                     let q: Value = serde_json::from_slice(&r.body).unwrap_or_default();
@@ -546,7 +565,7 @@ pub mod testing {
                 _ => (404, Vec::new()),
             }
         });
-        Engine { synths, bodies, srv }
+        Engine { queries, synths, bodies, srv }
     }
 
     fn percent_decode(s: &str) -> String {
@@ -571,7 +590,7 @@ pub mod testing {
 
 #[cfg(test)]
 mod tests {
-    use super::testing::engine;
+    use super::testing::{engine, engine_with};
     use super::*;
     use crate::speech::arbiter::Activity;
 
@@ -591,14 +610,17 @@ mod tests {
         let e = engine(|_| 200, |text| Duration::from_millis(if text == "長い文です。" { 300 } else { 5 }));
         // every 0: the warm-up is not left out because speech warmed the engine
         let a = AivisEngine::tuned(&e.srv.url, |a| a.every = Duration::ZERO);
+        let now = with_activity(&a, Activity::default());
         let cache = {
             let a = a.clone();
-            std::thread::spawn(move || a.synth_as(Use::Cache, &Cancel::new(), "長い文です。").map(|s| s.wav.len()))
+            std::thread::spawn(move || a.synth_as(Use::Cache, &Cancel::new(), "長い文です。", DEFAULT_RATE).map(|s| s.wav.len()))
         };
         wait_until("the cache holds the engine", || a.arbiter.held() == Some(Use::Cache));
+        // The user has said something meanwhile: a reply is on its way
+        *now.lock().unwrap() = Activity { busy: true, ..Activity::default() };
         a.warm_once();
         wait_until("the warm-up waits", || a.arbiter.waiting(Use::Warm) > 0);
-        let speech = a.synth(&Cancel::new(), "本番の文です。").unwrap();
+        let speech = a.synth(&Cancel::new(), "本番の文です。", DEFAULT_RATE).unwrap();
         assert!(speech.waited >= Duration::from_millis(100), "it waited for the cache phrase: {:?}", speech.waited);
         assert!(cache.join().unwrap().is_ok());
         wait_until("the warm-up ran", || e.synths.lock().unwrap().len() == 3);
@@ -634,29 +656,67 @@ mod tests {
         assert_eq!(e.synths.lock().unwrap().len(), 1, "the engine has just synthesized");
     }
 
-    /// A warm-up that waited `wait` in vain is left out.
+    /// A warm-up that waits for whisper is left out once nothing goes on
+    /// any more: no reply is coming that it would be for. (Before, it was
+    /// left out after waiting 30 seconds, also while a long subagent was
+    /// still at work, after which the reply comes.)
     #[test]
-    fn a_warm_up_is_left_out_after_wait() {
+    fn a_warm_up_is_left_out_when_no_reply_comes() {
         let e = engine(|_| 200, |_| Duration::ZERO);
-        let a = AivisEngine::tuned(&e.srv.url, |a| a.wait = Duration::from_millis(100));
+        let a = AivisEngine::new(&e.srv.url, 1, 1.3);
         let now = with_activity(&a, Activity { transcribing: true, busy: true, ..Activity::default() });
         a.warm_once();
-        // Whisper goes on well past `wait` and a poll or two
-        std::thread::sleep(Duration::from_millis(1000));
+        std::thread::sleep(Duration::from_millis(300));
         *now.lock().unwrap() = Activity::default();
+        std::thread::sleep(Duration::from_millis(300));
+        *now.lock().unwrap() = Activity { busy: true, ..Activity::default() };
         std::thread::sleep(Duration::from_millis(500));
-        assert!(e.synths.lock().unwrap().is_empty());
+        assert!(e.synths.lock().unwrap().is_empty(), "it gave up while nothing went on");
+    }
+
+    /// A chunk stopped while the engine reads it is not synthesized; the
+    /// engine stays taken until the reading is over (AivisSpeech goes on with
+    /// it), then is free.
+    #[test]
+    fn a_stopped_chunk_is_not_synthesized() {
+        let e = engine_with(|_| 200, |_| Duration::ZERO, |_| Duration::from_millis(300));
+        let a = AivisEngine::new(&e.srv.url, 1, 1.3);
+        let cancel = Cancel::new();
+        let (a2, c2) = (a.clone(), cancel.clone());
+        let t = std::thread::spawn(move || a2.synth(&c2, "止める文です。", DEFAULT_RATE).err());
+        wait_until("the engine reads the text", || e.queries.lock().unwrap().len() == 1);
+        cancel.cancel();
+        assert_eq!(t.join().unwrap(), Some(SynthError::Cancelled));
+        assert_eq!(a.arbiter.held(), Some(Use::Speech), "the engine is still at the reading");
+        wait_until("the engine is free", || a.arbiter.held().is_none());
+        assert!(e.bodies.lock().unwrap().is_empty(), "no synthesis was asked for");
+    }
+
+    /// Speech that waits for the engine counts the wait in its two chunk
+    /// timeouts: an engine stuck on an earlier request times speech out as
+    /// soon as one stuck on this chunk would.
+    #[test]
+    fn speech_counts_its_wait_for_the_engine() {
+        let e = engine(|_| 200, |_| Duration::ZERO);
+        let a = AivisEngine::tuned(&e.srv.url, |a| a.timeout = Duration::from_millis(100));
+        let stuck = a.arbiter.acquire(Use::Warm, &Cancel::new(), Duration::from_secs(1)).unwrap();
+        let t0 = Instant::now();
+        assert_eq!(a.synth(&Cancel::new(), "本番の文です。", DEFAULT_RATE).err(), Some(SynthError::Timeout));
+        let took = t0.elapsed();
+        assert!(took >= Duration::from_millis(200) && took < Duration::from_millis(700), "{took:?}");
+        drop(stuck);
+        assert!(a.synth(&Cancel::new(), "本番の文です。", DEFAULT_RATE).is_ok());
+        assert!(engine_bin().is_none(), "tests never start the real engine");
     }
 
     /// docs/design.md's account of P1 gives the warm-up's numbers.
     #[test]
     fn the_design_doc_has_the_warm_up() {
         let p1 = include_str!("../../docs/design.md").split("## P1 で").nth(1).unwrap().split("\n## ").next().unwrap();
-        for want in
-            [format!("{} 秒たっても", WARM_WAIT.as_secs()), format!("{} 秒以内に合成していれば", WARM_EVERY.as_secs()), format!("温めの文は「{WARM_TEXT}」")]
-        {
+        for want in [format!("{} 秒以内に合成していれば", WARM_EVERY.as_secs()), format!("温めの文は「{WARM_TEXT}」")] {
             assert!(p1.contains(&want), "the P1 section should say {want:?}");
         }
+        assert!(!p1.contains("30 秒たっても"), "the warm-up no longer gives up after 30 seconds");
     }
 
     #[test]
