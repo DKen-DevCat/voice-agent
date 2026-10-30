@@ -134,7 +134,8 @@ impl Serve {
     /// A message to conversation conv: claude moves to it first when it is
     /// on another. last_event: the last event the iPhone had when the user
     /// began it, which tells whether they had seen an approval (§14.9).
-    pub fn message(&self, conv: &str, text: &str, via: &str, last_event: Option<&str>) -> Result<u64, Reply> {
+    /// raw: the text is never a command (native-app.md §18.3.1 S6).
+    pub fn message(&self, conv: &str, text: &str, via: &str, raw: bool, last_event: Option<&str>) -> Result<u64, Reply> {
         if !self.sessions.exists(conv) {
             return Err(error(404, "unknown_conversation"));
         }
@@ -151,12 +152,15 @@ impl Serve {
                 self.ctl().switch_session(&session);
             }
             *lock(&self.conv) = Some(conv.to_string());
+            // The warmed claude took the conversation: the id it was started
+            // with was learned before there was one to put it on
+            self.keep_session();
         }
         let seen = last_event.and_then(parse_event_id).filter(|(run, _)| *run == self.hub.run()).map(|(_, seq)| seq);
         let shown = lock(&self.shown).clone();
         // From another run, the iPhone has seen none of this run's approvals
         let saw = move |id: &str| seen.zip(shown.get(id)).is_some_and(|(last, (seq, _))| last >= *seq);
-        Ok(self.ctl().handle_message(text, via, &saw))
+        Ok(self.ctl().handle_message(text, via, raw, &saw))
     }
 
     /// The iPhone's answer by button. An allow takes the approval key, and
@@ -209,6 +213,16 @@ impl Serve {
         }
         let _moving = lock(&self.moving);
         self.keep_session();
+    }
+
+    /// Claude says which session it is on (at once, from the controller):
+    /// written down for the conversation it is on, so that an id replaced
+    /// within a poll, or seen just before a crash, is kept (§18.10 item 10).
+    /// Takes no `moving` lock: it can come while message() holds it.
+    pub fn learned(&self, session: &str) {
+        if let Some(conv) = lock(&self.conv).clone() {
+            self.sessions.set_session(&conv, session);
+        }
     }
 
     /// Writes down the session claude is on for the conversation it is on
@@ -319,6 +333,8 @@ pub fn run(args: &[String]) -> i32 {
     let s = serve.clone();
     let ctl = Controller::new_with(cfg, Hooks::from_env(), rt.clone(), Box::new(move |evs| s.on_events(evs)), Front::Serve);
     serve.attach(ctl.clone());
+    let s = serve.clone();
+    ctl.set_on_session(Box::new(move |id| s.learned(id)));
     let server = match tiny_http::Server::http(("127.0.0.1", port)) {
         Ok(s) => s,
         Err(e) => {
@@ -464,6 +480,8 @@ done
         let s = serve.clone();
         let ctl = Controller::new_with(cfg, Hooks::default(), home.join("rt"), Box::new(move |evs| s.on_events(evs)), Front::Serve);
         serve.attach(ctl.clone());
+        let s = serve.clone();
+        ctl.set_on_session(Box::new(move |id| s.learned(id)));
         ctl.test_open_claude(fake_claude(&home));
         let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
         let addr = server.server_addr().to_ip().unwrap().to_string();
@@ -669,9 +687,81 @@ done
         }
         let sa = h.ctl.session_id();
         assert!(!sa.is_empty());
-        assert_eq!(h.serve.sessions.session(&a), None);
+        // S3: the controller told serve at once, so no poll is needed
+        assert_eq!(h.serve.sessions.session(&a).as_deref(), Some(sa.as_str()));
         assert_eq!(call(&h, Some(&h.device), "POST", &format!("/agent/sessions/{b}/messages"), &body, "runA").0, 200);
         assert_eq!(h.serve.sessions.session(&a).as_deref(), Some(sa.as_str()));
+        h.ctl.close();
+    }
+
+    /// S3 (§18.3.1, §18.10 item 10): the ids are written where they are
+    /// learned, not by the once-a-second poll, so two replaced within a second
+    /// are both kept. Found: the controller's callback runs before the poll
+    /// ever does (no poll is called in this test).
+    #[test]
+    fn two_sessions_within_a_second_are_both_kept() {
+        let h = harness();
+        pair(&h);
+        let conv = call(&h, Some(&h.device), "POST", "/agent/sessions", "{}", "runA").1["id"].as_str().unwrap().to_string();
+        let body = json!({"text": "やあ", "via": "text"}).to_string();
+        assert_eq!(call(&h, Some(&h.device), "POST", &format!("/agent/sessions/{conv}/messages"), &body, "runA").0, 200);
+        for _ in 0..500 {
+            if h.serve.sessions.session(&conv).is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let first = h.serve.sessions.session(&conv).expect("recorded by the callback, with no poll");
+        // the session is resumed and replaced twice before a poll could look
+        h.serve.learned("resumed-1");
+        h.serve.learned("resumed-2");
+        assert_eq!(h.serve.sessions.all_sessions(&conv), [first.as_str(), "resumed-1", "resumed-2"]);
+        assert_eq!(h.serve.sessions.session(&conv).as_deref(), Some("resumed-2"));
+        // and they are in the file
+        let again = Sessions::load(&h.home.join("conf/sessions.json"));
+        assert_eq!(again.all_sessions(&conv).len(), 3);
+        h.ctl.close();
+    }
+
+    /// An id learned while claude is on no conversation (the warmed one) is
+    /// picked up when a conversation takes it (a real claude can speak first).
+    #[test]
+    fn an_id_learned_with_no_conversation_goes_to_the_first() {
+        let h = harness();
+        pair(&h);
+        h.serve.learned("too-early");
+        let conv = call(&h, Some(&h.device), "POST", "/agent/sessions", "{}", "runA").1["id"].as_str().unwrap().to_string();
+        assert_eq!(h.serve.sessions.session(&conv), None, "no conversation yet: nothing to put it on");
+        h.ctl.close();
+    }
+
+    /// S6 over HTTP: `raw:true` on a message makes 「止めて」 go to Claude
+    /// (fate `sent`); without it (the old callers) it is a command.
+    #[test]
+    fn raw_and_fate_over_http() {
+        let h = harness();
+        pair(&h);
+        let (_, state) = call(&h, Some(&h.device), "GET", "/agent/state", "", "");
+        let mut events = open_events(&h, &format!("runA:{}", state["seq"]));
+        let conv = call(&h, Some(&h.device), "POST", "/agent/sessions", "{}", "runA").1["id"].as_str().unwrap().to_string();
+        let path = format!("/agent/sessions/{conv}/messages");
+
+        let body = json!({"text": "止めて", "via": "text"}).to_string();
+        assert_eq!(call(&h, Some(&h.device), "POST", &path, &body, "runA").0, 200);
+        let user = next(&mut events, "user");
+        assert_eq!((user["text"].as_str(), user["fate"].as_str()), (Some("止めて"), Some("command")));
+
+        let body = json!({"text": "止めて", "via": "text", "raw": true}).to_string();
+        assert_eq!(call(&h, Some(&h.device), "POST", &path, &body, "runA").0, 200);
+        let user = next(&mut events, "user");
+        assert_eq!((user["text"].as_str(), user["fate"].as_str()), (Some("止めて"), Some("sent")));
+        // Claude answers it: it was a message, not a command
+        assert_eq!(next(&mut events, "assistant")["text"], "了解");
+
+        // a raw that is not a boolean is no raw
+        let body = json!({"text": "ストップ", "raw": "true"}).to_string();
+        assert_eq!(call(&h, Some(&h.device), "POST", &path, &body, "runA").0, 200);
+        assert_eq!(next(&mut events, "user")["fate"], "command");
         h.ctl.close();
     }
 
