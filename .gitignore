@@ -1,0 +1,9 @@
+/target
+# Agent worktrees and local settings
+.claude/
+# Runtime files live outside the repository; keep stray ones out
+*.log
+*.jsonl
+*.wav
+*.aiff
+.env*
