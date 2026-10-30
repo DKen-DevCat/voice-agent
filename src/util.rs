@@ -22,6 +22,32 @@ fn is_executable(p: &Path) -> bool {
     std::fs::metadata(p).is_ok_and(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
 }
 
+/// s with a leading `~/` (or a lone `~`) in home.
+pub fn expand_home(s: &str, home: &Path) -> PathBuf {
+    match s.strip_prefix("~/") {
+        Some(rest) => home.join(rest),
+        None if s == "~" => home.to_path_buf(),
+        None => PathBuf::from(s),
+    }
+}
+
+/// N random bytes from the kernel. Tokens made of zeros would be guessed, so
+/// a failure stops the program instead of going on.
+pub fn random_bytes<const N: usize>() -> [u8; N] {
+    let mut b = [0u8; N];
+    for chunk in b.chunks_mut(256) {
+        // SAFETY: getentropy fills chunk.len() bytes (at most 256) of a buffer we own
+        let rc = unsafe { libc::getentropy(chunk.as_mut_ptr().cast(), chunk.len()) };
+        assert_eq!(rc, 0, "getentropy failed");
+    }
+    b
+}
+
+/// Compares secrets without telling by the time where they differ.
+pub fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+}
+
 pub fn unix_millis() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_millis() as i64)
 }

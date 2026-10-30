@@ -17,8 +17,8 @@ use crate::agent::agents::{AGENT_FAILED, AGENT_STOPPED, AgentChange, AgentInfo, 
 use crate::agent::claude::{Callbacks, ClaudeSession};
 use crate::agent::mcp::{McpServer, Tool, ToolResult};
 use crate::agent::policy::{
-    APPROVE, Decision, DenyRule, JOB_START, JOB_STATUS, JOB_STOP, JOB_TAIL, SHELL_INPUT, SHELL_LIST, SHELL_NEW, SHELL_RUN, SHELL_SCREEN, ask_reasons, decide,
-    load_deny_rules, parse_consent,
+    APPROVE, Decision, DenyRule, Guarded, JOB_START, JOB_STATUS, JOB_STOP, JOB_TAIL, SHELL_INPUT, SHELL_LIST, SHELL_NEW, SHELL_RUN, SHELL_SCREEN, ask_reasons,
+    decide, guard, load_deny_rules, parse_consent,
 };
 use crate::agent::prompt;
 use crate::agent::tools::{self, ToolHost, with_shell};
@@ -39,6 +39,8 @@ use crate::util::{fmt_elapsed, home_dir, look_path, unix_millis, write_private};
 use crate::voice::commands::{self, Command};
 
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(180);
+/// Under serve: long enough to take the iPhone out and unlock it (U1)
+const SERVE_APPROVAL_TIMEOUT: Duration = Duration::from_secs(600);
 /// How long a call the user allowed through the approve tool may take to arrive.
 const APPROVED_FOR: Duration = Duration::from_secs(600);
 
@@ -88,6 +90,17 @@ pub enum EventKind {
     Status,
     Agent, // a subagent started, moved on or finished
     Usage, // tokens, cost or rate limits changed
+    /// Under serve: a message said yes to an approval; the iPhone has to
+    /// sign the allow with its approval key (Face ID or passcode)
+    ApprovalConfirm,
+}
+
+/// What the agent talks through: the terminal window, or the iPhone app
+/// (`voice-agent serve`: no window, no mic, no speech on the Mac).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Front {
+    Terminal,
+    Serve,
 }
 
 #[derive(Clone, Debug, Default, Serialize)]
@@ -100,6 +113,12 @@ pub struct Event {
     pub reason: String, // why an approval is needed
     pub allow: bool,
     pub state: String, // Status
+    /// ApprovalResolved: what answered it (user / button / message / timeout / stop)
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub by: String,
+    /// ApprovalResolved under serve: the number of the key that signed the allow
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub key: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub agent: Option<AgentInfo>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -143,6 +162,23 @@ struct Approval {
     answer: mpsc::Sender<(bool, String)>,
     at: Instant,    // when it was raised: an answer has to begin after it
     prompt: String, // what is said for it
+    summary: String,
+    reason: String,
+}
+
+/// The approval answers go to, as serve shows it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Pending {
+    pub id: String,
+    pub summary: String,
+    pub reason: String,
+}
+
+/// Why an answer by number was not taken.
+#[derive(Debug, PartialEq, Eq)]
+pub enum AnswerError {
+    /// It is not the oldest one waiting (or not waiting at all)
+    NotOldest,
 }
 
 #[derive(Default)]
@@ -174,6 +210,9 @@ pub struct Controller {
     cfg: Config,
     hooks: Hooks,
     deliver: Deliver,
+    front: Front,
+    approval_timeout: Duration,
+    guarded: Guarded,
 
     speaker: Arc<Speaker>,
     chunker: Mutex<SentenceChunker>,
@@ -196,6 +235,28 @@ impl Controller {
     /// Events reach the UI through deliver, in order. The shells, jobs and
     /// logs live in runtime_dir.
     pub fn new(cfg: Config, hooks: Hooks, runtime_dir: PathBuf, deliver: Deliver) -> Arc<Controller> {
+        Controller::new_with(cfg, hooks, runtime_dir, deliver, Front::Terminal)
+    }
+
+    /// As new, for front: under serve nothing is spoken on the Mac (no
+    /// AivisSpeech engine, no player, no `say`) and approvals wait longer.
+    pub fn new_with(cfg: Config, hooks: Hooks, runtime_dir: PathBuf, deliver: Deliver, front: Front) -> Arc<Controller> {
+        let serve = front == Front::Serve;
+        // What the agent may not write: the paired keys, the sessions and the
+        // control socket; under serve all of voice-agent's settings and the
+        // folders approvals rest on (the terminal's agent may still read and
+        // edit its config and persona, as before)
+        let conf = cfg.file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let mut paths = vec![runtime_dir.join("control.sock")];
+        if serve {
+            paths.push(conf);
+            // Claude Code's own settings (its permissions and hooks)
+            paths.push(crate::util::home_dir().join(".claude"));
+            paths.extend(cfg.protect.iter().cloned());
+        } else if !conf.as_os_str().is_empty() {
+            paths.extend([conf.join("devices.json"), conf.join("sessions.json")]);
+        }
+        let guarded = Guarded::new(paths, serve, cfg.dir.clone());
         Arc::new_cyclic(|weak: &Weak<Controller>| {
             let w = weak.clone();
             let describe = Box::new(move |name: &str, input: &Map<String, Value>| w.upgrade().map(|c| c.describe_tool(name, input)).unwrap_or_default());
@@ -217,7 +278,7 @@ impl Controller {
 
             let latency = Arc::new(Latency::new(Some(hooks.latency_log.clone().unwrap_or_else(|| runtime_dir.join("latency.jsonl")))));
             let (mut aivis, mut player, mut phrases) = (None, None, None);
-            if cfg.tts == "aivis" {
+            if cfg.tts == "aivis" && !serve {
                 let engine = AivisEngine::new(&cfg.aivis_url, cfg.aivis_speaker, cfg.aivis_speed);
                 let w = weak.clone();
                 let _ = engine.arbiter.activity.set(Box::new(move || w.upgrade().map(|c| c.activity()).unwrap_or_default()));
@@ -240,7 +301,8 @@ impl Controller {
                 aivis,
                 player,
                 hooks.tts_out.clone(),
-                cfg.speak,
+                // Under serve the voice goes to the iPhone (N3); nothing here
+                cfg.speak && !serve,
                 Box::new(move || {
                     if let Some(c) = w.upgrade() {
                         c.status();
@@ -261,6 +323,9 @@ impl Controller {
                 cfg,
                 hooks,
                 deliver,
+                front,
+                approval_timeout: if serve { SERVE_APPROVAL_TIMEOUT } else { APPROVAL_TIMEOUT },
+                guarded,
                 speaker,
                 chunker: Mutex::new(chunker),
                 latency,
@@ -295,6 +360,21 @@ impl Controller {
     }
 
     pub fn start(self: &Arc<Self>) -> Result<(), String> {
+        if self.front == Front::Terminal {
+            self.start_voice();
+        }
+        // The main shell is ready before the first command needs it
+        let c = self.clone();
+        std::thread::spawn(move || {
+            if let Err(e) = c.shells.shell(MAIN) {
+                c.emit(Event::new(EventKind::Error, format!("裏のシェルを起動できません: {e}")));
+            }
+        });
+        self.start_tools()
+    }
+
+    /// The terminal's ears and voice: whisper, the speakers, the mic.
+    fn start_voice(self: &Arc<Self>) {
         match look_path("whisper-server") {
             None => {
                 self.emit(Event::new(EventKind::Error, "whisper-server が見つかりません (brew install whisper-cpp)。音声入力は使えません。"));
@@ -328,14 +408,10 @@ impl Controller {
                 log(&format!("audio: {e}"));
             }
         });
-        // The main shell is ready before the first command needs it
-        let c = self.clone();
-        std::thread::spawn(move || {
-            if let Err(e) = c.shells.shell(MAIN) {
-                c.emit(Event::new(EventKind::Error, format!("裏のシェルを起動できません: {e}")));
-            }
-        });
+    }
 
+    /// The MCP server with the tools, then claude.
+    fn start_tools(self: &Arc<Self>) -> Result<(), String> {
         let host: Arc<dyn ToolHost> = self.clone();
         let mut tools = tools::tools(Arc::downgrade(&host));
         tools.push(self.approve_tool());
@@ -366,8 +442,13 @@ impl Controller {
 
     fn start_claude(self: &Arc<Self>, bin: PathBuf, mcp_config: &std::path::Path) {
         let args = self.claude_args(mcp_config);
+        self.open_claude(bin, self.claude_env(std::env::vars_os()), args);
+    }
+
+    /// claude's environment, from ours.
+    fn claude_env(&self, vars: impl Iterator<Item = (OsString, OsString)>) -> Vec<(OsString, OsString)> {
         // A claude started from inside another Claude Code session would refuse to run
-        let mut env: Vec<(OsString, OsString)> = std::env::vars_os()
+        let mut env: Vec<(OsString, OsString)> = vars
             .filter(|(k, _)| {
                 let k = k.to_string_lossy();
                 k != "CLAUDECODE" && k != "CLAUDE_CODE_ENTRYPOINT" && !k.starts_with("VA_")
@@ -375,7 +456,13 @@ impl Controller {
             .collect();
         // MCP tools load up front instead of through an extra ToolSearch round trip
         env.push(("ENABLE_TOOL_SEARCH".into(), "false".into()));
-        self.open_claude(bin, env, args);
+        // Claude Code waits this long for a tool of ours, and an approval can
+        // take approval_timeout (some versions are reported to stop MCP calls
+        // at 60 s). The user's own setting wins.
+        if !env.iter().any(|(k, _)| k == "MCP_TOOL_TIMEOUT") {
+            env.push(("MCP_TOOL_TIMEOUT".into(), (self.approval_timeout + Duration::from_secs(60)).as_millis().to_string().into()));
+        }
+        env
     }
 
     /// Starts the claude session the conversation goes to.
@@ -467,6 +554,13 @@ impl Controller {
         .collect();
         if !self.cfg.model.is_empty() {
             args.extend(["--model".to_string(), self.cfg.model.clone()]);
+        }
+        // Under serve the agent edits its working directory without asking:
+        // a .claude/settings there could allow what the guard refuses, or run
+        // commands from hooks past every approval. Only the user's settings
+        // count (found in the security review; ~/.claude is guarded)
+        if self.front == Front::Serve {
+            args.extend(["--setting-sources".to_string(), "user".to_string()]);
         }
         if !self.cfg.effort.is_empty() {
             args.extend(["--effort".to_string(), self.cfg.effort.clone()]);
@@ -662,10 +756,26 @@ impl Controller {
         self.handle_heard(text, via, now, turn);
     }
 
+    /// A message from the iPhone (serve). saw: whether the sender had seen
+    /// the approval with this id when they began it (native-app.md §14.9).
+    /// Gives its turn in the latency log.
+    pub fn handle_message(self: &Arc<Self>, text: &str, via: &str, saw: &dyn Fn(&str) -> bool) -> u64 {
+        let turn = if text.trim().is_empty() { 0 } else { self.latency.begin(via, Instant::now()) };
+        self.heard(text, via, turn, &|a: &Approval| saw(&a.id));
+        turn
+    }
+
     /// What the user said or typed, beginning at began (turn: its turn in
     /// the latency log): the answer to the approval that waits, a spoken
     /// command, or a message for Claude.
     fn handle_heard(self: &Arc<Self>, text: &str, via: &str, began: Instant, turn: u64) {
+        // Only one begun after the approval was raised answers it (not a
+        // request that was under way)
+        self.heard(text, via, turn, &|a: &Approval| a.at <= began);
+    }
+
+    /// As handle_heard; after: whether the text was begun after an approval.
+    fn heard(self: &Arc<Self>, text: &str, via: &str, turn: u64, after: &dyn Fn(&Approval) -> bool) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -673,14 +783,21 @@ impl Controller {
         self.emit(Event { via: via.to_string(), ..Event::new(EventKind::User, text) });
 
         let cmd = commands::parse(text);
-        let first = self.lock().approvals.first().map(|a| (a.id.clone(), a.at));
-        if let Some((id, at)) = first {
+        let first = {
+            let st = self.lock();
+            st.approvals.first().map(|a| (a.id.clone(), after(a)))
+        };
+        if let Some((id, after)) = first {
             self.latency.finish(turn, "approval");
-            // Only a clear yes or no answers it, and only one begun after it
-            // was raised (not a request that was under way). 「生成もストップ」
-            // refuses it with everything else; 「静かにして」 only quiets.
-            let answer = if at <= began && cmd != Some(Command::StopAll) { parse_consent(text) } else { None };
+            // Only a clear yes or no answers it. 「生成もストップ」 refuses it
+            // with everything else; 「静かにして」 only quiets.
+            let answer = if after && cmd != Some(Command::StopAll) { parse_consent(text) } else { None };
             match (answer, cmd) {
+                // Under serve a message is signed with the device key, which a
+                // rebuilt app can use without Face ID: only the approval key
+                // allows, so the iPhone is asked to sign it (§14.9)
+                (Some(true), _) if self.front == Front::Serve => self.emit(Event { id, ..Event::new(EventKind::ApprovalConfirm, "") }),
+                (Some(false), _) if self.front == Front::Serve => self.answer_as(&id, false, "message", ""),
                 (Some(allow), _) => self.answer(&id, allow),
                 (None, Some(Command::StopAll)) => self.abort(),
                 (None, Some(Command::MicOff)) => self.set_mic(false),
@@ -803,7 +920,7 @@ impl Controller {
     fn deny_all(&self, message: &str) {
         let ids: Vec<String> = self.lock().approvals.iter().map(|a| a.id.clone()).collect();
         for id in ids {
-            self.resolve_approval(&id, false, message);
+            self.resolve_approval_as(&id, false, message, "stop", "");
         }
     }
 
@@ -814,13 +931,53 @@ impl Controller {
         true
     }
 
+    /// The iPhone's answer by number (serve): taken only for the oldest one
+    /// waiting, the one it shows. by: button / message; key: the number of
+    /// the key that signed it.
+    pub fn answer_by_id(&self, id: &str, allow: bool, by: &str, key: &str) -> Result<(), AnswerError> {
+        if self.lock().approvals.first().map(|a| a.id.as_str()) != Some(id) {
+            return Err(AnswerError::NotOldest);
+        }
+        self.answer_as(id, allow, by, key);
+        Ok(())
+    }
+
+    /// The approval answers go to (serve shows it).
+    pub fn pending_approval(&self) -> Option<Pending> {
+        self.lock().approvals.first().map(|a| Pending { id: a.id.clone(), summary: a.summary.clone(), reason: a.reason.clone() })
+    }
+
     /// The user's yes or no to an approval. The rest of the turn is heard
     /// again (talking to answer silenced it), and the engine is warmed for
     /// the reply that comes after it, as for anything sent to Claude.
     fn answer(&self, id: &str, allow: bool) {
+        self.answer_as(id, allow, "user", "");
+    }
+
+    fn answer_as(&self, id: &str, allow: bool, by: &str, key: &str) {
         self.lock().hushed = false;
-        self.resolve_approval(id, allow, "The user denied this action.");
+        self.resolve_approval_as(id, allow, "The user denied this action.", by, key);
         self.speaker.warm();
+    }
+
+    /// Moves to another conversation (serve): what is under way stops (the
+    /// approvals are refused, Ctrl-C to the shells), and claude starts again
+    /// on session the next time something is sent. The jobs carry on: they
+    /// belong to voice-agent, not to a conversation.
+    pub fn switch_session(self: &Arc<Self>, session: &str) {
+        self.deny_all("The user moved to another conversation.");
+        self.shells.interrupt_all();
+        self.latency.finish_reply("stopped");
+        if let Some(c) = self.claude() {
+            c.switch_to(session);
+        }
+        self.close_assistant();
+        self.status();
+    }
+
+    /// Claude's id for the conversation under way (empty before its first reply).
+    pub fn session_id(&self) -> String {
+        self.claude().map(|c| c.session_id()).unwrap_or_default()
     }
 
     /// How many subagents and jobs are at work.
@@ -931,6 +1088,17 @@ impl Controller {
         }
     }
 
+    /// For serve's tests: a stand-in for claude, and claude's permission prompt.
+    #[cfg(test)]
+    pub(crate) fn test_open_claude(self: &Arc<Self>, bin: PathBuf) {
+        self.open_claude(bin, Vec::new(), Vec::new());
+    }
+
+    #[cfg(test)]
+    pub(crate) fn test_approve(&self, args: &Map<String, Value>) -> Value {
+        self.approve(args)
+    }
+
     /// Answers claude's permission prompt for a tool call.
     fn approve(&self, args: &Map<String, Value>) -> Value {
         let name = args.get("tool_name").and_then(Value::as_str).unwrap_or_default();
@@ -945,6 +1113,11 @@ impl Controller {
     /// call allowed that way through the approve tool (prompt) is remembered,
     /// so that the tool itself does not ask again when it runs (!prompt).
     fn check(&self, tool: &str, input: &Map<String, Value>, from_tool: bool) -> Result<(), String> {
+        // What voice-agent guards is refused before anything else, never asked
+        if let Some(reason) = guard(tool, input, &self.guarded, self.runs_in(tool, input).as_deref()) {
+            self.emit(Event::tool("blocked", self.summary(tool, input)));
+            return Err(reason);
+        }
         let decision = decide(tool, input, &self.deny);
         let reason = match decision {
             Decision::Allow => return Ok(()),
@@ -973,10 +1146,26 @@ impl Controller {
         Ok(())
     }
 
+    /// Where a shell tool's command would run: the shell's directory, or the
+    /// dir it is given (job_start: else where the main shell is).
+    fn runs_in(&self, tool: &str, input: &Map<String, Value>) -> Option<String> {
+        let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        let cwd_of = |name: &str| self.shells.get(if name.is_empty() { MAIN } else { name }).map(|sh| sh.status().cwd).filter(|c| !c.is_empty());
+        let given = Some(s("dir")).filter(|d| !d.is_empty());
+        match tool {
+            SHELL_RUN | SHELL_INPUT => cwd_of(&s("shell")),
+            JOB_START => given.or_else(|| cwd_of(MAIN)),
+            SHELL_NEW => given,
+            _ => None,
+        }
+    }
+
     /// What a call does, as the approval shows it.
     fn summary(&self, tool: &str, input: &Map<String, Value>) -> String {
         let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
         match tool {
+            // Where a job runs shows too, when it is given
+            JOB_START if !s("dir").trim().is_empty() => format!("{}（{}）", with_shell(s("shell"), s("command")), self.short(s("dir").trim())),
             SHELL_RUN | JOB_START => with_shell(s("shell"), s("command")),
             SHELL_INPUT => with_shell(s("shell"), &format!("入力 {:?}", s("text"))),
             _ => {
@@ -994,7 +1183,14 @@ impl Controller {
             let mut st = self.lock();
             st.ap_seq += 1;
             let id = format!("ap{}", st.ap_seq);
-            st.approvals.push(Approval { id: id.clone(), answer: tx, at: Instant::now(), prompt: prompt.clone() });
+            st.approvals.push(Approval {
+                id: id.clone(),
+                answer: tx,
+                at: Instant::now(),
+                prompt: prompt.clone(),
+                summary: summary.to_string(),
+                reason: reason.to_string(),
+            });
             (id, st.approvals.len() == 1)
         };
         // The reply waits for the user now: its times would be theirs
@@ -1006,16 +1202,17 @@ impl Controller {
             self.announce(&prompt);
         }
         self.status();
-        match rx.recv_timeout(APPROVAL_TIMEOUT) {
+        match rx.recv_timeout(self.approval_timeout) {
             Ok(answer) => answer,
             Err(_) => {
-                self.resolve_approval(&id, false, "No answer from the user in time.");
+                self.resolve_approval_as(&id, false, "No answer from the user in time.", "timeout", "");
                 (false, "No answer from the user in time.".to_string())
             }
         }
     }
 
-    fn resolve_approval(&self, id: &str, allow: bool, message: &str) {
+    /// by: what answered it; key: the key that signed the allow (serve).
+    fn resolve_approval_as(&self, id: &str, allow: bool, message: &str, by: &str, key: &str) {
         let (approval, next) = {
             let mut st = self.lock();
             let i = st.approvals.iter().position(|a| a.id == id);
@@ -1026,7 +1223,7 @@ impl Controller {
         };
         let Some(a) = approval else { return };
         let message = if message.is_empty() { "The user denied this action." } else { message };
-        self.emit(Event { id: id.to_string(), allow, ..Event::new(EventKind::ApprovalResolved, "") });
+        self.emit(Event { id: id.to_string(), allow, by: by.to_string(), key: key.to_string(), ..Event::new(EventKind::ApprovalResolved, "") });
         let _ = a.answer.send((allow, message.to_string()));
         if let Some(prompt) = next {
             self.announce(&prompt);
@@ -1224,8 +1421,177 @@ mod tests {
         (Controller::new(cfg, hooks, rt, Box::new(move |evs| ev.lock().unwrap().extend(evs))), events)
     }
 
+    /// A controller under serve. Its config file is in a temporary folder
+    /// (what it guards), with protect: [that folder/trust].
+    fn serve_controller() -> (Arc<Controller>, Arc<Mutex<Vec<Event>>>, PathBuf) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let ev = events.clone();
+        let home = std::env::temp_dir().join(format!("va-serve-{}-{}", std::process::id(), crate::serve::sessions::new_id()));
+        std::fs::create_dir_all(home.join("trust")).unwrap();
+        let mut cfg = Config::load(Path::new("/nonexistent-home"));
+        cfg.tts = "aivis".into();
+        cfg.speak = true;
+        cfg.dir = home.join("work");
+        cfg.file = home.join("conf/config.json");
+        cfg.protect = vec![home.join("trust")];
+        let rt = home.join("rt");
+        (Controller::new_with(cfg, Hooks::default(), rt, Box::new(move |evs| ev.lock().unwrap().extend(evs)), Front::Serve), events, home)
+    }
+
     fn args(v: Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap()
+    }
+
+    #[test]
+    fn under_serve_claude_reads_only_the_users_settings() {
+        // found in the security review: the agent edits its working
+        // directory without asking, and a .claude/settings there could allow
+        // what the guard refuses or run hooks past every approval
+        let (serve, _, _home) = serve_controller();
+        let argv = serve.claude_args(Path::new("/x/mcp.json"));
+        let i = argv.iter().position(|a| a == "--setting-sources").expect("--setting-sources");
+        assert_eq!(argv[i + 1], "user");
+        let (terminal, _) = controller();
+        assert!(!terminal.claude_args(Path::new("/x/mcp.json")).iter().any(|a| a == "--setting-sources"), "the terminal reads them all, as before");
+        // and the user's own settings are guarded under serve
+        let settings = crate::util::home_dir().join(".claude/settings.json");
+        assert_eq!(serve.approve(&args(json!({"tool_name": "Write", "input": {"file_path": settings}})))["behavior"], "deny");
+    }
+
+    #[test]
+    fn a_job_shows_where_it_runs() {
+        let (c, events, home) = serve_controller();
+        let c2 = c.clone();
+        let dir = home.join("work/app");
+        let d = dir.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": JOB_START, "input": {"command": "git push origin main", "dir": d}}))));
+        wait_status(&c, "CONFIRM");
+        let approval = kinds(&events, EventKind::Approval).remove(0);
+        assert!(approval.text.starts_with("git push origin main（"), "{}", approval.text);
+        assert!(approval.text.contains("app"), "{}", approval.text);
+        c.answer_by_id("ap1", false, "button", "k").unwrap();
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+    }
+
+    #[test]
+    fn claude_waits_for_an_approval_as_long_as_it_can_take() {
+        let get = |env: &[(OsString, OsString)], k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
+        let (serve, _, _) = serve_controller();
+        let env =
+            serve.claude_env(vec![("PATH".into(), "/usr/bin".into()), ("VA_SERVE_KEY".into(), "secret".into()), ("CLAUDECODE".into(), "1".into())].into_iter());
+        assert_eq!(get(&env, "MCP_TOOL_TIMEOUT").as_deref(), Some("660000"), "ten minutes and one");
+        assert_eq!(get(&env, "VA_SERVE_KEY"), None, "the wrapper's key stays with voice-agent");
+        assert_eq!(get(&env, "CLAUDECODE"), None);
+        assert_eq!(get(&env, "PATH").as_deref(), Some("/usr/bin"));
+        let (terminal, _) = controller();
+        assert_eq!(get(&terminal.claude_env(std::iter::empty()), "MCP_TOOL_TIMEOUT").as_deref(), Some("240000"));
+        // the user's own setting wins
+        let mine = terminal.claude_env(vec![("MCP_TOOL_TIMEOUT".into(), "5000000".into())].into_iter());
+        assert_eq!(mine.iter().filter(|(k, _)| k == "MCP_TOOL_TIMEOUT").count(), 1);
+        assert_eq!(get(&mine, "MCP_TOOL_TIMEOUT").as_deref(), Some("5000000"));
+    }
+
+    #[test]
+    fn serve_speaks_nothing_on_the_mac() {
+        // found in the design review: splitting start() alone would still
+        // build the AivisSpeech engine and speak every reply with `say`
+        let (c, _, _) = serve_controller();
+        assert!(c.speaker.aivis.is_none(), "no AivisSpeech engine");
+        assert!(c.speaker.player.is_none(), "no player");
+        assert!(!c.speaker.is_enabled(), "nothing is spoken");
+        assert_eq!(c.approval_timeout, SERVE_APPROVAL_TIMEOUT);
+    }
+
+    #[test]
+    fn under_serve_a_yes_asks_the_iphone_to_sign_and_a_no_refuses() {
+        let (c, events, _) = serve_controller();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        // a message is signed with the device key: its yes does not allow
+        c.handle_message("はい", "text", &|_| true);
+        assert_eq!(c.status_now(), "CONFIRM");
+        assert!(!asked.is_finished());
+        let confirm = kinds(&events, EventKind::ApprovalConfirm);
+        assert_eq!(confirm.len(), 1);
+        assert_eq!(confirm[0].id, "ap1");
+        // begun before the approval was seen: not an answer
+        c.handle_message("いいえ", "text", &|_| false);
+        assert_eq!(c.status_now(), "CONFIRM");
+        // a no is safe, and taken
+        c.handle_message("いいえ", "text", &|id| id == "ap1");
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+        let resolved = kinds(&events, EventKind::ApprovalResolved);
+        assert_eq!((resolved[0].allow, resolved[0].by.as_str()), (false, "message"));
+    }
+
+    #[test]
+    fn answers_by_number_go_to_the_oldest_only() {
+        let (c, events, _) = serve_controller();
+        let pending = |cmd: &'static str| {
+            let c2 = c.clone();
+            std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": cmd}}))))
+        };
+        let first = pending("git push origin main");
+        wait_status(&c, "CONFIRM");
+        let second = pending("gh pr merge 3");
+        while c.lock().approvals.len() < 2 {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(c.pending_approval().map(|p| (p.id, p.summary)), Some(("ap1".to_string(), "git push origin main".to_string())));
+        assert_eq!(c.answer_by_id("ap2", true, "button", "k1"), Err(AnswerError::NotOldest));
+        assert_eq!(c.answer_by_id("ap1", true, "button", "k1"), Ok(()));
+        assert_eq!(first.join().unwrap()["behavior"], "allow");
+        assert_eq!(c.answer_by_id("ap1", true, "button", "k1"), Err(AnswerError::NotOldest), "answered already");
+        assert_eq!(c.answer_by_id("ap2", false, "button", "k1"), Ok(()));
+        assert_eq!(second.join().unwrap()["behavior"], "deny");
+        let resolved = kinds(&events, EventKind::ApprovalResolved);
+        assert_eq!((resolved[0].by.as_str(), resolved[0].key.as_str()), ("button", "k1"));
+    }
+
+    #[test]
+    fn the_guard_refuses_before_any_question() {
+        let (c, events, home) = serve_controller();
+        for input in [
+            json!({"file_path": home.join("trust/server/app.py")}),
+            json!({"file_path": home.join("conf/devices.json")}),
+            json!({"file_path": home.join("rt/control.sock")}),
+        ] {
+            let v = c.approve(&args(json!({"tool_name": "Write", "input": input})));
+            assert_eq!(v["behavior"], "deny", "{input}");
+            assert_eq!(v["message"], crate::agent::policy::GUARD_REASON);
+        }
+        let v = c.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "voice-agent pair 123456"}})));
+        assert_eq!(v["behavior"], "deny");
+        // where a job or a new shell would run counts too (found in the review)
+        let v = c.approve(&args(json!({"tool_name": JOB_START, "input": {"command": "echo x >> start.sh", "dir": home.join("trust")}})));
+        assert_eq!(v["behavior"], "deny");
+        let v = c.approve(&args(json!({"tool_name": SHELL_NEW, "input": {"name": "w", "dir": home.join("trust/ios")}})));
+        assert_eq!(v["behavior"], "deny");
+        assert_eq!(c.status_now(), "STANDBY", "nothing was asked");
+        assert_eq!(kinds(&events, EventKind::Tool).iter().filter(|e| e.tag == "blocked").count(), 6);
+        // the terminal guards the keys, the sessions and the socket, not the
+        // trust base, and its agent may still read its config and persona
+        let (t, _) = controller();
+        let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "./target/release/voice-agent unpair"}})));
+        assert_eq!(v["behavior"], "deny");
+        let conf = t.cfg.file.parent().unwrap().to_path_buf();
+        let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": format!("cat {}", conf.join("persona.md").display())}})));
+        assert_eq!(v["behavior"], "allow");
+        let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": format!("cat x > {}", conf.join("devices.json").display())}})));
+        assert_eq!(v["behavior"], "deny");
+    }
+
+    #[test]
+    fn moving_to_another_conversation_refuses_what_waits() {
+        let (c, events, _) = serve_controller();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        c.switch_session("s2");
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+        assert_eq!(kinds(&events, EventKind::ApprovalResolved)[0].by, "stop");
+        wait_status(&c, "STANDBY");
     }
 
     fn wait_status(c: &Controller, want: &str) {

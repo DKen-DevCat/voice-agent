@@ -87,6 +87,7 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 | `language` | `ja` | 音声認識の言語 |
 | `holdMs` | `300` | Space をこの時間（ミリ秒）押し続けると録音が始まる |
 | `mascot` | `true` | マスコットを出すか |
+| `protect` | `["~/voice-agent", "~/lfm3-vl-server"]` | 承認の守りの土台のフォルダ。`serve` のエージェントはここへ書き込めず（固定で断る）、`serve` の作業フォルダはこの中にも、これを含む所にも置けない |
 
 人格は、設定と同じ場所の `persona.md` に書きます。中身はシステムプロンプトの最後に足されます。今は空で構いません。
 
@@ -102,6 +103,30 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 - `mcp.json`: Claude Code に渡す MCP の設定（接続用のトークン入り。本人だけが読める 0600 で、終了時に消します）
 - `latency.jsonl`: 返答の速さの記録（下の「返答の速さ」）
 - `phrases/`: 決まった文（確認の文、声のコマンドへの返事など）の音声。AivisSpeech が空いているときに作っておき、すぐに鳴らします。声、速さ、エンジンの版のどれかが変わると作り直します（出力デバイスを替えても作り直さず、再生するときに変換します）
+- `control.sock`: `serve` が動いている間だけ。Mac で打つ `voice-agent pair`・`unpair` を受けます（0600）
+
+`serve` は設定と同じ場所（`~/.config/voice-agent/`）にも置きます（どれも 0600。キャッシュと違って消されないように）:
+
+- `devices.json`: 対にした iPhone の 2 つの公開鍵と、対にした・解いた履歴
+- `sessions.json`: 会話の番号と、Claude Code のセッション ID の対応
+
+## iPhone アプリから使う（serve）
+
+`voice-agent serve` は、ターミナルの画面の代わりに `127.0.0.1:8082` に HTTP の口を開き、lfm3-vl-server の iPhone アプリから使えるようにします（設計は lfm3-vl-server の `docs/native-app.md` §14）。ふだんは lfm3-vl-server の `start.sh` が起動します。
+
+```bash
+VA_SERVE_KEY=<ラッパーと同じ鍵> voice-agent serve --dir ~/agent-work
+voice-agent pair 123456   # iPhone の「Mac と対にする」に出た番号
+voice-agent unpair        # 対を解く（iPhone を失くした時など。ふだんは iPhone から解く）
+```
+
+- Mac では何も話さず、マイクも Whisper も AivisSpeech も起こしません（N2 は文字だけ）
+- 届く要求は、どれも対にした iPhone の鍵で署名されたものだけを受け付けます。許可は、iPhone の承認の鍵（Face ID かパスコード）で署名したものだけです。文字の「はい」では許可にせず、iPhone に Face ID での確かめを求めます
+- 承認の待ちは 10 分です（ターミナルは 180 秒）
+- `--dir` の作業フォルダは必須です。設定の `protect` のフォルダ（既定は voice-agent と lfm3-vl-server）、設定の場所、実行時の場所の中にも、それらを含む所にも置けません。Claude Code は作業フォルダの中を承認なしで編集するためです
+- エージェントは、`protect` のフォルダと voice-agent の設定の場所・`control.sock` に書き込めず、`voice-agent pair`・`unpair`・`serve` も動かせません（確認ではなく固定で断ります）。そこで動くコマンドも断ります（`job_start`・`shell_new` の `dir`、そこへ移ったシェル）。ターミナルでも、`devices.json`・`sessions.json`・`control.sock` と、この 3 つのコマンドは断ります（設定と `persona.md` は今までどおり読み書きできます）
+- Claude Code は `--setting-sources user` で起動し、`~/.claude/settings.json` だけを読みます。作業フォルダの中はエージェントが承認なしで書けるので、そこに置かれた `.claude/settings*.json`（許可のルールやフック）は効きません。`~/.claude` への書き込みも固定で断ります
+- 別の会話に送ると、Claude Code をその会話のセッションの続き（`--resume`）で開き直します。ジョブは止めません
 
 ## 返答の速さ
 
