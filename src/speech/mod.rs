@@ -2,5 +2,6 @@
 
 pub mod aivis;
 pub mod arbiter;
+pub mod phrases;
 pub mod stt;
 pub mod tts;

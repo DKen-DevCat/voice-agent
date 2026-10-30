@@ -17,7 +17,7 @@ use crate::agent::agents::{AGENT_FAILED, AGENT_STOPPED, AgentChange, AgentInfo, 
 use crate::agent::claude::{Callbacks, ClaudeSession};
 use crate::agent::mcp::{McpServer, Tool, ToolResult};
 use crate::agent::policy::{
-    APPROVE, Decision, DenyRule, JOB_START, JOB_STATUS, JOB_STOP, JOB_TAIL, SHELL_INPUT, SHELL_LIST, SHELL_NEW, SHELL_RUN, SHELL_SCREEN, decide,
+    APPROVE, Decision, DenyRule, JOB_START, JOB_STATUS, JOB_STOP, JOB_TAIL, SHELL_INPUT, SHELL_LIST, SHELL_NEW, SHELL_RUN, SHELL_SCREEN, ask_reasons, decide,
     load_deny_rules, parse_consent,
 };
 use crate::agent::prompt;
@@ -26,12 +26,15 @@ use crate::agent::usage::{Usage, UsageTracker};
 use crate::audio::capture::{RecError, Recorder};
 use crate::audio::playback::PcmPlayer;
 use crate::config::Config;
+use crate::latency::{Latency, Mark};
 use crate::log::log;
 use crate::shell::jobs::Jobs;
 use crate::shell::registry::{MAIN, Registry, ShellOptions};
 use crate::speech::aivis::AivisEngine;
+use crate::speech::arbiter::Activity;
+use crate::speech::phrases::Phrases;
 use crate::speech::stt::WhisperServer;
-use crate::speech::tts::{SentenceChunker, Speaker};
+use crate::speech::tts::{CODE_NOTICE, SentenceChunker, Speaker, split_sentences};
 use crate::util::{fmt_elapsed, home_dir, look_path, unix_millis, write_private};
 use crate::voice::commands::{self, Command};
 
@@ -43,6 +46,12 @@ const APPROVED_FOR: Duration = Duration::from_secs(600);
 pub const ABORTED: &str = "（すべて止めました）";
 /// Said when a reply to a pending approval is neither yes nor no.
 const CONFIRM_AGAIN: &str = "承認待ちです。はいか、いいえで答えてください。";
+// What voice-agent says itself; the phrase cache keeps it ready (fixed_phrases)
+const ASK_HEAD: &str = "確認です。";
+const ASK_TAIL: &str = "実行していいですか？";
+const ERROR_SAID: &str = "エラーが発生しました。";
+const MIC_OFF_SAID: &str = "マイクを切りました。";
+const MIC_ON_SAID: &str = "マイクを戻しました。";
 
 /// The tools whose handlers show their own calls in the conversation.
 const SELF_NOTED: [&str; 9] = [SHELL_RUN, SHELL_SCREEN, SHELL_LIST, SHELL_NEW, SHELL_INPUT, JOB_START, JOB_STATUS, JOB_TAIL, JOB_STOP];
@@ -111,15 +120,21 @@ impl Event {
 /// What only tests set.
 #[derive(Clone, Debug, Default)]
 pub struct Hooks {
-    pub tts_out: Option<PathBuf>,   // VA_TTS_OUT: speech goes to audio files instead of the speakers
-    pub event_log: Option<PathBuf>, // VA_EVENT_LOG: every event is appended as a JSON line
-    pub test_steps: String,         // VA_TEST_STEPS: [{"at":3000,"text":"..."},{"at":9000,"wav":"/x.wav"}]
+    pub tts_out: Option<PathBuf>,     // VA_TTS_OUT: speech goes to audio files instead of the speakers
+    pub event_log: Option<PathBuf>,   // VA_EVENT_LOG: every event is appended as a JSON line
+    pub test_steps: String,           // VA_TEST_STEPS: [{"at":3000,"text":"..."},{"at":9000,"wav":"/x.wav"}]
+    pub latency_log: Option<PathBuf>, // VA_LATENCY_LOG: the latency log goes here instead of the runtime directory
 }
 
 impl Hooks {
     pub fn from_env() -> Hooks {
         let path = |k: &str| std::env::var_os(k).filter(|v| !v.is_empty()).map(PathBuf::from);
-        Hooks { tts_out: path("VA_TTS_OUT"), event_log: path("VA_EVENT_LOG"), test_steps: std::env::var("VA_TEST_STEPS").unwrap_or_default() }
+        Hooks {
+            tts_out: path("VA_TTS_OUT"),
+            event_log: path("VA_EVENT_LOG"),
+            test_steps: std::env::var("VA_TEST_STEPS").unwrap_or_default(),
+            latency_log: path("VA_LATENCY_LOG"),
+        }
     }
 }
 
@@ -149,6 +164,8 @@ struct State {
     last_status: String,
     ap_seq: u32,
     stt_err: String,
+    /// Jobs Esc stopped, for Claude to hear of with the next message
+    jobs_stopped: Vec<String>,
 }
 
 type Deliver = Box<dyn Fn(Vec<Event>) + Send + Sync>;
@@ -160,6 +177,7 @@ pub struct Controller {
 
     speaker: Arc<Speaker>,
     chunker: Mutex<SentenceChunker>,
+    latency: Arc<Latency>,
     stt: Mutex<Option<Arc<WhisperServer>>>,
     rec: Recorder,
     mcp: Mutex<Option<McpServer>>,
@@ -197,18 +215,26 @@ impl Controller {
                 }
             }))));
 
-            let (mut aivis, mut player) = (None, None);
+            let latency = Arc::new(Latency::new(Some(hooks.latency_log.clone().unwrap_or_else(|| runtime_dir.join("latency.jsonl")))));
+            let (mut aivis, mut player, mut phrases) = (None, None, None);
             if cfg.tts == "aivis" {
                 let engine = AivisEngine::new(&cfg.aivis_url, cfg.aivis_speaker, cfg.aivis_speed);
                 let w = weak.clone();
-                let _ = engine.expected.set(Box::new(move || w.upgrade().is_some_and(|c| c.reply_expected())));
+                let _ = engine.arbiter.activity.set(Box::new(move || w.upgrade().map(|c| c.activity()).unwrap_or_default()));
+                let w = weak.clone();
+                let _ = engine.on_ready.set(Box::new(move || {
+                    if let Some(c) = w.upgrade() {
+                        c.speaker.build_phrases(fixed_phrases());
+                    }
+                }));
                 aivis = Some(engine);
                 if hooks.tts_out.is_none() {
                     player = Some(Arc::new(PcmPlayer::default()));
                 }
+                phrases = Some(Phrases::new(runtime_dir.join("phrases")));
             }
             let w = weak.clone();
-            let speaker = Arc::new(Speaker::new(
+            let mut speaker = Speaker::new(
                 &cfg.voice,
                 cfg.voice_rate,
                 aivis,
@@ -220,8 +246,12 @@ impl Controller {
                         c.status();
                     }
                 }),
-            ));
-            let chunker = chunker_for(&speaker);
+            );
+            speaker.phrases = phrases;
+            let l = latency.clone();
+            speaker.tap = Some(Box::new(move |s| l.sounded(s)));
+            let speaker = Arc::new(speaker);
+            let chunker = chunker_for(&speaker, &latency);
             let level = Arc::new(AtomicU64::new(0));
             let l = level.clone();
             let shells = Registry::new(ShellOptions { shell: cfg.shell.clone(), dir: cfg.dir.clone(), runtime_dir: runtime_dir.clone() });
@@ -233,6 +263,7 @@ impl Controller {
                 deliver,
                 speaker,
                 chunker: Mutex::new(chunker),
+                latency,
                 stt: Mutex::new(None),
                 rec: Recorder::new(move |v| l.store(v.to_bits(), Ordering::Relaxed)),
                 mcp: Mutex::new(None),
@@ -320,7 +351,7 @@ impl Controller {
             None => self.emit(Event::new(EventKind::Error, "claude コマンドが見つかりません。Claude Code をインストールしてください。")),
             Some(bin) => self.start_claude(bin, &mcp_config),
         }
-        // After claude: the engine asks reply_expected, which looks at the session
+        // After claude: the arbiter asks about the activity, which looks at the session
         if let Some(a) = self.speaker.aivis.clone() {
             std::thread::spawn(move || a.start());
         }
@@ -344,7 +375,11 @@ impl Controller {
             .collect();
         // MCP tools load up front instead of through an extra ToolSearch round trip
         env.push(("ENABLE_TOOL_SEARCH".into(), "false".into()));
+        self.open_claude(bin, env, args);
+    }
 
+    /// Starts the claude session the conversation goes to.
+    fn open_claude(self: &Arc<Self>, bin: PathBuf, env: Vec<(OsString, OsString)>, args: Vec<String>) {
         let w = Arc::downgrade(self);
         let with = move |f: &dyn Fn(&Arc<Controller>)| {
             if let Some(c) = w.upgrade() {
@@ -360,6 +395,7 @@ impl Controller {
             on_text: Box::new(move |t| {
                 w2(&|c| {
                     c.lock().assistant_open = true;
+                    c.latency.mark_reply(Mark::FirstText);
                     c.emit(Event::new(EventKind::Assistant, t));
                     // Under the chunker's lock, so that hush cannot slip in between
                     let mut chunker = c.chunker.lock().unwrap_or_else(|e| e.into_inner());
@@ -383,10 +419,11 @@ impl Controller {
                     c.chunker.lock().unwrap_or_else(|e| e.into_inner()).flush();
                     c.close_assistant();
                     let hushed = std::mem::take(&mut c.lock().hushed);
+                    c.latency.reply_ended(is_error);
                     if is_error {
                         c.emit(Event::new(EventKind::Error, if result.is_empty() { "エラーが発生しました" } else { result }));
                         if !hushed {
-                            c.speaker.speak("エラーが発生しました。");
+                            c.speaker.speak(ERROR_SAID);
                         }
                     }
                     c.status();
@@ -461,12 +498,19 @@ impl Controller {
                 if step.wav.is_empty() {
                     c.handle_user_text(&step.text, "text");
                 } else if let Ok(data) = std::fs::read(&step.wav) {
-                    c.lock().transcribing += 1;
-                    c.status();
-                    c.transcribe_counted(&data, Instant::now());
+                    c.transcribe_wav(&data);
                 }
             });
         }
+    }
+
+    /// What the user just said, as a WAV recording (a test step).
+    fn transcribe_wav(self: &Arc<Self>, wav: &[u8]) {
+        let now = Instant::now();
+        let turn = self.latency.begin("voice", now);
+        self.lock().transcribing += 1;
+        self.status();
+        self.transcribe_counted(wav, now, turn);
     }
 
     // --- voice ---
@@ -493,13 +537,12 @@ impl Controller {
             st.recording = true;
             st.began = Some(t0);
         }
-        // A reply is coming: get the voice model resident meanwhile
-        self.speaker.warm();
         self.status();
     }
 
     /// Closes the microphone and sends what was said (cancel: throws it away).
     pub fn stop_recording(self: &Arc<Self>, cancel: bool) {
+        let released = Instant::now();
         let (began, deferred) = {
             let mut st = self.lock();
             if !st.recording {
@@ -512,6 +555,7 @@ impl Controller {
             }
             (st.began.take().unwrap_or_else(Instant::now), std::mem::take(&mut st.deferred))
         };
+        let turn = if cancel { 0 } else { self.latency.begin("voice", released) };
         self.status();
         for text in deferred {
             self.speaker.speak(&text);
@@ -522,12 +566,13 @@ impl Controller {
             if cancel {
                 return;
             }
-            let notice = match recorded {
-                Some((Ok(wav), secs)) if secs >= 0.35 => return c.transcribe_counted(&wav, began),
-                Some((Err(RecError::Silence), _)) => Event::new(EventKind::Notice, "（声が聞こえませんでした）"),
-                Some((Err(e), _)) => Event::new(EventKind::Error, e.to_string()),
-                _ => Event::new(EventKind::Notice, "（短すぎて聞き取れませんでした）"),
+            let (notice, end) = match recorded {
+                Some((Ok(wav), secs)) if secs >= 0.35 => return c.transcribe_counted(&wav, began, turn),
+                Some((Err(RecError::Silence), _)) => (Event::new(EventKind::Notice, "（声が聞こえませんでした）"), "no-speech"),
+                Some((Err(e), _)) => (Event::new(EventKind::Error, e.to_string()), "error"),
+                _ => (Event::new(EventKind::Notice, "（短すぎて聞き取れませんでした）"), "no-speech"),
             };
+            c.latency.finish(turn, end);
             c.lock().transcribing -= 1;
             c.status();
             c.emit(notice);
@@ -552,12 +597,12 @@ impl Controller {
         if on {
             // The device is set up again by the next recording
             self.emit(Event::new(EventKind::Notice, "（マイクを戻しました）"));
-            self.speaker.speak("マイクを戻しました。");
+            self.speaker.speak(MIC_ON_SAID);
         } else {
             self.stop_recording(true);
             self.rec.close();
             self.emit(Event::new(EventKind::Notice, "（マイクを切りました。m キーで戻せます）"));
-            self.speaker.speak("マイクを切りました。");
+            self.speaker.speak(MIC_OFF_SAID);
         }
         self.status();
     }
@@ -567,14 +612,22 @@ impl Controller {
     }
 
     /// Expects State.transcribing to count this request already. began: when
-    /// the user started saying it.
-    fn transcribe_counted(self: &Arc<Self>, wav: &[u8], began: Instant) {
+    /// the user started saying it; turn: its turn in the latency log.
+    fn transcribe_counted(self: &Arc<Self>, wav: &[u8], began: Instant, turn: u64) {
         let stt = self.stt.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let res = stt.as_ref().map(|s| {
             if !s.is_ready() {
                 self.emit(Event::new(EventKind::Notice, "（音声認識エンジンを起動中です。最初だけ時間がかかります）"));
+                // stt_start comes once it is up: the turn says it waited for that
+                self.latency.note(turn, "stt_cold", true);
             }
-            s.transcribe(wav)
+            self.latency.note(turn, "stt", "final");
+            s.start().and_then(|()| {
+                self.latency.mark(turn, Mark::SttStart);
+                let res = s.transcribe(wav);
+                self.latency.mark(turn, Mark::SttEnd);
+                res
+            })
         });
         let stt_err = {
             let mut st = self.lock();
@@ -584,12 +637,19 @@ impl Controller {
         self.status();
         match res {
             None => {
+                self.latency.finish(turn, "error");
                 let why = if stt_err.is_empty() { String::new() } else { format!("（{stt_err}）") };
                 self.emit(Event::new(EventKind::Error, format!("音声認識が使えません。{why}")));
             }
-            Some(Err(e)) => self.emit(Event::new(EventKind::Error, format!("音声認識エラー: {e}"))),
-            Some(Ok(text)) if text.is_empty() => self.emit(Event::new(EventKind::Notice, "（聞き取れませんでした）")),
-            Some(Ok(text)) => self.handle_heard(&text, "voice", began),
+            Some(Err(e)) => {
+                self.latency.finish(turn, "error");
+                self.emit(Event::new(EventKind::Error, format!("音声認識エラー: {e}")));
+            }
+            Some(Ok(text)) if text.is_empty() => {
+                self.latency.finish(turn, "no-speech");
+                self.emit(Event::new(EventKind::Notice, "（聞き取れませんでした）"));
+            }
+            Some(Ok(text)) => self.handle_heard(&text, "voice", began, turn),
         }
     }
 
@@ -597,12 +657,15 @@ impl Controller {
 
     /// What the user typed (or a test step said), just now.
     pub fn handle_user_text(self: &Arc<Self>, text: &str, via: &str) {
-        self.handle_heard(text, via, Instant::now());
+        let now = Instant::now();
+        let turn = if text.trim().is_empty() { 0 } else { self.latency.begin(via, now) };
+        self.handle_heard(text, via, now, turn);
     }
 
-    /// What the user said or typed, beginning at began: the answer to the
-    /// approval that waits, a spoken command, or a message for Claude.
-    fn handle_heard(self: &Arc<Self>, text: &str, via: &str, began: Instant) {
+    /// What the user said or typed, beginning at began (turn: its turn in
+    /// the latency log): the answer to the approval that waits, a spoken
+    /// command, or a message for Claude.
+    fn handle_heard(self: &Arc<Self>, text: &str, via: &str, began: Instant, turn: u64) {
         let text = text.trim();
         if text.is_empty() {
             return;
@@ -612,13 +675,13 @@ impl Controller {
         let cmd = commands::parse(text);
         let first = self.lock().approvals.first().map(|a| (a.id.clone(), a.at));
         if let Some((id, at)) = first {
+            self.latency.finish(turn, "approval");
             // Only a clear yes or no answers it, and only one begun after it
             // was raised (not a request that was under way). 「生成もストップ」
             // refuses it with everything else; 「静かにして」 only quiets.
             let answer = if at <= began && cmd != Some(Command::StopAll) { parse_consent(text) } else { None };
             match (answer, cmd) {
-                (Some(true), _) => self.resolve_approval(&id, true, ""),
-                (Some(false), _) => self.resolve_approval(&id, false, "The user denied this action."),
+                (Some(allow), _) => self.answer(&id, allow),
                 (None, Some(Command::StopAll)) => self.abort(),
                 (None, Some(Command::MicOff)) => self.set_mic(false),
                 (None, Some(Command::Stop)) => self.hush(),
@@ -631,6 +694,7 @@ impl Controller {
         }
 
         if let Some(cmd) = cmd {
+            self.latency.finish(turn, "command");
             match cmd {
                 Command::Stop => self.stop(),
                 Command::StopAll => self.abort(),
@@ -640,37 +704,47 @@ impl Controller {
         }
 
         let Some(claude) = self.claude() else {
+            self.latency.finish(turn, "error");
             return self.emit(Event::new(EventKind::Error, "Claude に接続できません。"));
         };
-        if !claude.busy() {
+        // A reply whose end is still being handled counts as under way
+        let busy = claude.busy() || self.latency.answering();
+        if busy {
+            // It goes in after the reply under way: the times would be that reply's
+            self.latency.finish(turn, "busy");
+        } else {
             // A reply silenced before is over; this one is heard
             self.lock().hushed = false;
         }
-        let msg = format!("{text}\n\n<va_context>main shell cwd: {}</va_context>", self.cwd());
-        if let Err(e) = claude.send(&msg) {
-            self.emit(Event::new(EventKind::Error, format!("Claude に送れません: {e}")));
+        let msg = format!("{text}\n\n<va_context>{}</va_context>", self.context());
+        match claude.send(&msg) {
+            Ok(()) => {
+                if !busy {
+                    self.latency.replying_to(turn);
+                }
+                self.latency.mark(turn, Mark::Sent);
+            }
+            Err(e) => {
+                self.latency.finish(turn, "error");
+                self.emit(Event::new(EventKind::Error, format!("Claude に送れません: {e}")));
+            }
         }
+        // Whisper is done with it, and the reply is a few seconds off: the time
+        // to get the voice model resident (once an utterance)
         self.speaker.warm();
         self.status();
     }
 
-    /// Gets the voice ready ahead of a message the user is about to type.
-    pub fn warm(&self) {
-        self.speaker.warm();
-    }
-
-    /// Reports that a reply is on its way or being spoken (and speech is not
-    /// muted): the user is talking, claude is working on what they said, or a
-    /// subagent is still at work (the front end relays its result).
-    fn reply_expected(&self) -> bool {
-        if !self.speaker.is_enabled() {
-            return false;
-        }
-        let hearing = {
+    /// What else is going on, for the arbiter: whether the engine may be
+    /// warmed up or used for the phrase cache.
+    fn activity(&self) -> Activity {
+        let (talking, transcribing) = {
             let st = self.lock();
-            st.recording || st.transcribing > 0
+            (st.recording, st.transcribing > 0)
         };
-        hearing || self.claude().is_some_and(|c| c.busy()) || self.speaker.speaking() || self.agents.running() > 0
+        let agents = self.agents.running() > 0;
+        let busy = talking || transcribing || agents || self.claude().is_some_and(|c| c.busy()) || self.speaker.speaking();
+        Activity { transcribing, agents, busy }
     }
 
     /// 「止めて」: silence for the rest of the reply, pending approvals refused,
@@ -683,8 +757,8 @@ impl Controller {
         self.status();
     }
 
-    /// Esc and 「生成もストップ」: that, and the reply is interrupted too.
-    /// Jobs keep running; job_stop ends them.
+    /// Esc and 「生成もストップ」: that, and the reply is interrupted too, and
+    /// the jobs are stopped.
     pub fn abort(self: &Arc<Self>) {
         self.hush();
         self.deny_all("The user aborted.");
@@ -696,6 +770,22 @@ impl Controller {
         self.agents.stop_all();
         self.emit(Event::new(EventKind::Notice, ABORTED));
         self.status();
+        // Waits up to STOP_GRACE for what does not end at once (the key
+        // handler calls this on a thread of its own)
+        let stopped = self.jobs.stop_all();
+        self.lock().jobs_stopped.extend(stopped.iter().map(|j| format!("#{} {}", j.id, j.command.trim())));
+    }
+
+    /// What Claude is told with a message: where the main shell is, and the
+    /// jobs Esc has stopped since the last message (Claude would take them
+    /// to be running).
+    fn context(&self) -> String {
+        let stopped = std::mem::take(&mut self.lock().jobs_stopped);
+        let mut ctx = format!("main shell cwd: {}", self.cwd());
+        if !stopped.is_empty() {
+            ctx.push_str(&format!("\njobs the user stopped with Esc: {}", stopped.join(", ")));
+        }
+        ctx
     }
 
     /// Silences the speech and the rest of the reply; the half sentence the
@@ -704,9 +794,10 @@ impl Controller {
         {
             let mut chunker = self.chunker.lock().unwrap_or_else(|e| e.into_inner());
             self.lock().hushed = true;
-            *chunker = chunker_for(&self.speaker);
+            *chunker = chunker_for(&self.speaker, &self.latency);
         }
         self.speaker.stop();
+        self.latency.finish_reply("stopped");
     }
 
     fn deny_all(&self, message: &str) {
@@ -719,8 +810,17 @@ impl Controller {
     /// Answers the oldest pending approval from the keyboard.
     pub fn answer_approval(&self, allow: bool) -> bool {
         let Some(id) = self.lock().approvals.first().map(|a| a.id.clone()) else { return false };
-        self.resolve_approval(&id, allow, "The user denied this action.");
+        self.answer(&id, allow);
         true
+    }
+
+    /// The user's yes or no to an approval. The rest of the turn is heard
+    /// again (talking to answer silenced it), and the engine is warmed for
+    /// the reply that comes after it, as for anything sent to Claude.
+    fn answer(&self, id: &str, allow: bool) {
+        self.lock().hushed = false;
+        self.resolve_approval(id, allow, "The user denied this action.");
+        self.speaker.warm();
     }
 
     /// How many subagents and jobs are at work.
@@ -889,7 +989,7 @@ impl Controller {
     /// Asks the user and waits for the answer: (allowed, message for claude).
     fn ask_approval(&self, summary: &str, reason: &str) -> (bool, String) {
         let (tx, rx) = mpsc::channel();
-        let prompt = format!("確認です。{reason}。実行していいですか？");
+        let prompt = ask_prompt(reason);
         let (id, first) = {
             let mut st = self.lock();
             st.ap_seq += 1;
@@ -897,6 +997,8 @@ impl Controller {
             st.approvals.push(Approval { id: id.clone(), answer: tx, at: Instant::now(), prompt: prompt.clone() });
             (id, st.approvals.len() == 1)
         };
+        // The reply waits for the user now: its times would be theirs
+        self.latency.finish_reply("approval");
         self.emit(Event { id: id.clone(), reason: reason.to_string(), ..Event::new(EventKind::Approval, summary) });
         // Approvals are answered oldest first: one waiting behind another is
         // said when its turn comes
@@ -1009,6 +1111,7 @@ impl Controller {
     /// Stops everything voice-agent started: claude, the engines, the
     /// shells and the jobs.
     pub fn close(&self) {
+        self.latency.finish_all("quit");
         if let Some(c) = self.claude() {
             c.stop();
         }
@@ -1016,6 +1119,9 @@ impl Controller {
             s.stop();
         }
         self.speaker.stop();
+        if let Some(p) = &self.speaker.phrases {
+            p.stop();
+        }
         if let Some(a) = &self.speaker.aivis {
             a.stop();
         }
@@ -1033,9 +1139,36 @@ impl Controller {
 }
 
 /// Cuts the reply into sentences for speaker.
-fn chunker_for(speaker: &Arc<Speaker>) -> SentenceChunker {
-    let (s1, s2) = (speaker.clone(), speaker.clone());
-    SentenceChunker::new(Box::new(move |s| s1.speak(s)), Some(Box::new(move || s2.eager_first())))
+fn chunker_for(speaker: &Arc<Speaker>, latency: &Arc<Latency>) -> SentenceChunker {
+    let (s1, s2, l) = (speaker.clone(), speaker.clone(), latency.clone());
+    SentenceChunker::new(
+        Box::new(move |s| {
+            let turn = l.replying();
+            // Only speech that is queued will sound (or be skipped) and end the
+            // turn; marked before, since it may sound at once
+            if s1.is_enabled() {
+                l.mark(turn, Mark::FirstChunk);
+            }
+            s1.speak_reply(s, turn);
+        }),
+        Some(Box::new(move || s2.eager_first())),
+    )
+}
+
+/// What is said for an approval: each reason a sentence of its own, so that
+/// every part of it is in the phrase cache.
+fn ask_prompt(reason: &str) -> String {
+    let reasons: String = reason.split('、').map(|r| format!("{r}。")).collect();
+    format!("{ASK_HEAD}{reasons}{ASK_TAIL}")
+}
+
+/// What voice-agent says itself, sentence by sentence as speech goes: the
+/// phrase cache keeps these ready.
+fn fixed_phrases() -> Vec<String> {
+    let mut texts: Vec<String> =
+        [ASK_HEAD, ASK_TAIL, CONFIRM_AGAIN, ERROR_SAID, MIC_OFF_SAID, MIC_ON_SAID, CODE_NOTICE].iter().flat_map(|t| split_sentences(t)).collect();
+    texts.extend(ask_reasons().iter().map(|r| format!("{r}。")));
+    texts
 }
 
 /// Identifies a call: the tool and its exact input.
@@ -1075,14 +1208,20 @@ mod tests {
     use std::path::Path;
 
     fn controller() -> (Arc<Controller>, Arc<Mutex<Vec<Event>>>) {
+        controller_with(Hooks::default(), Path::new("/work"))
+    }
+
+    /// Speech is off ("speak": false), and there is no claude until a test
+    /// opens one (in dir, which then has to be there).
+    fn controller_with(hooks: Hooks, dir: &Path) -> (Arc<Controller>, Arc<Mutex<Vec<Event>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let ev = events.clone();
         let mut cfg = Config::load(Path::new("/nonexistent-home"));
         cfg.tts = "say".into();
         cfg.speak = false;
-        cfg.dir = "/work".into();
+        cfg.dir = dir.to_path_buf();
         let rt = std::env::temp_dir().join(format!("va-app-{}-{}", std::process::id(), unix_millis()));
-        (Controller::new(cfg, Hooks::default(), rt, Box::new(move |evs| ev.lock().unwrap().extend(evs))), events)
+        (Controller::new(cfg, hooks, rt, Box::new(move |evs| ev.lock().unwrap().extend(evs))), events)
     }
 
     fn args(v: Value) -> Map<String, Value> {
@@ -1171,6 +1310,25 @@ mod tests {
         assert_eq!(kinds(&events, EventKind::Approval).len(), 2, "neither asked");
     }
 
+    /// Esc (and 「生成もストップ」) stops the jobs too; 「止めて」 leaves them be.
+    #[test]
+    fn esc_stops_the_jobs() {
+        let dir = std::env::temp_dir().join(format!("va-jobs-{}-{}", std::process::id(), unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, _) = controller_with(Hooks::default(), &dir);
+        let job = c.jobs.start("sleep 20", None).unwrap();
+        c.stop();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(c.running().1, 1, "「止めて」 leaves the job running");
+        c.abort();
+        wait_for("the job is stopped", || c.running().1 == 0);
+        // Claude hears of it with the next message, once
+        assert!(c.context().contains(&format!("jobs the user stopped with Esc: #{} sleep 20", job.id)));
+        assert!(!c.context().contains("jobs the user stopped"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime_dir);
+    }
+
     #[test]
     fn spoken_commands_act_at_once() {
         let (c, events) = controller();
@@ -1228,10 +1386,10 @@ mod tests {
         let c2 = c.clone();
         let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
         wait_status(&c, "CONFIRM");
-        c.handle_heard("はい", "voice", before);
+        c.handle_heard("はい", "voice", before, 0);
         assert!(!asked.is_finished(), "said before the question");
         assert!(kinds(&events, EventKind::Notice).iter().any(|e| e.text.contains("はいか、いいえ")));
-        c.handle_heard("はい", "voice", Instant::now());
+        c.handle_heard("はい", "voice", Instant::now(), 0);
         assert_eq!(asked.join().unwrap()["behavior"], "allow");
     }
 
@@ -1284,6 +1442,194 @@ mod tests {
         assert_eq!(c.describe_tool(APPROVE, &Map::new()).0, "");
         assert_eq!(c.summary(SHELL_INPUT, &args(json!({"text": "y", "shell": "b"}))), "b › 入力 \"y\"");
         assert_eq!(approval_key("t", &args(json!({"b": 1, "a": "x"}))), approval_key("t", &args(json!({"a": "x", "b": 1}))));
+    }
+
+    /// What voice-agent says for an approval and its other fixed sentences
+    /// are all in the phrase cache, sentence by sentence as speech cuts them.
+    #[test]
+    fn what_voice_agent_says_is_cached() {
+        let cached = fixed_phrases();
+        assert_eq!(cached.len(), 27);
+        let mut said: Vec<String> = [CONFIRM_AGAIN, ERROR_SAID, MIC_OFF_SAID, MIC_ON_SAID, CODE_NOTICE].iter().flat_map(|t| split_sentences(t)).collect();
+        for r in ask_reasons() {
+            said.extend(split_sentences(&ask_prompt(r)));
+        }
+        // A question with several reasons says each as a sentence
+        let both = ask_prompt("リモートへ push します、外部サービスへ変更を反映します");
+        assert_eq!(both, "確認です。リモートへ push します。外部サービスへ変更を反映します。実行していいですか？");
+        said.extend(split_sentences(&both));
+        for s in said {
+            assert!(cached.contains(&s), "{s:?} is not cached");
+        }
+    }
+
+    /// docs/design.md's account of P1 counts the phrases the cache keeps.
+    #[test]
+    fn the_design_doc_counts_the_phrases() {
+        let p1 = include_str!("../docs/design.md").split("## P1 で").nth(1).unwrap().split("\n## ").next().unwrap();
+        for want in [format!("キャッシュ**: {} 文", fixed_phrases().len()), format!("理由 {}", ask_reasons().len())] {
+            assert!(p1.contains(&want), "the P1 section should say {want:?}");
+        }
+    }
+
+    /// A claude stand-in: answers every message with the same short reply,
+    /// pause seconds after it came in.
+    fn fake_claude(dir: &Path, pause: &str) -> PathBuf {
+        let path = dir.join("claude");
+        let lines = [
+            r#"{"type":"system","subtype":"init","session_id":"s1","model":"fake"}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"はい、テストを"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"実行します。全部通りました。"}}}"#,
+            r#"{"type":"stream_event","event":{"type":"content_block_stop","index":0}}"#,
+            r#"{"type":"result","subtype":"success","is_error":false,"result":"はい、テストを実行します。全部通りました。","session_id":"s1"}"#,
+        ];
+        let body: String = lines.iter().map(|l| format!("  printf '%s\\n' '{l}'\n")).collect();
+        std::fs::write(&path, format!("#!/bin/sh\nwhile IFS= read -r line; do\n  sleep {pause}\n{body}done\n")).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn log_lines(path: &Path, kind: &str) -> Vec<Map<String, Value>> {
+        let text = std::fs::read_to_string(path).unwrap_or_default();
+        text.lines().filter_map(|l| serde_json::from_str::<Value>(l).ok()?.as_object().cloned()).filter(|l| l["kind"] == kind).collect()
+    }
+
+    fn wait_for(what: &str, f: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    /// A spoken turn from end to end, with stand-ins for whisper, claude and
+    /// AivisSpeech: every step is in latency.jsonl, in order. Then, once the
+    /// phrase cache is built, a cached phrase sounds within 100 ms.
+    #[test]
+    fn a_turn_in_the_latency_log() {
+        use crate::audio::wav::tests::test_wav;
+        use crate::latency::MARKS;
+        use crate::net::testing::serve;
+        use crate::speech::aivis::testing::engine;
+
+        let dir = std::env::temp_dir().join(format!("va-turn-{}-{}", std::process::id(), unix_millis()));
+        std::fs::create_dir_all(dir.join("tts")).unwrap();
+        let aivis = engine(|_| 200, |_| Duration::from_millis(5));
+        let whisper = serve(|r| if r.url == "/inference" { (200, r#"{"text":"テストを実行して"}"#.as_bytes().to_vec()) } else { (404, Vec::new()) });
+        let mut cfg = Config::load(Path::new("/nonexistent-home"));
+        cfg.tts = "aivis".into();
+        cfg.aivis_url = aivis.srv.url.clone();
+        cfg.speak = true;
+        cfg.dir = dir.clone();
+        let log = dir.join("latency.jsonl");
+        let hooks = Hooks { tts_out: Some(dir.join("tts")), latency_log: Some(log.clone()), ..Hooks::default() };
+        let c = Controller::new(cfg, hooks, dir.join("rt"), Box::new(|_| {}));
+        *c.stt.lock().unwrap() = Some(WhisperServer::ready_at(&whisper.url));
+        c.open_claude(fake_claude(&dir, "0"), Vec::new(), Vec::new());
+        let a = c.speaker.aivis.clone().unwrap();
+        a.start();
+        wait_for("the engine is up", || !a.is_down());
+
+        c.transcribe_wav(&test_wav(1.0, 16000));
+        wait_for("the turn is written", || !log_lines(&log, "turn").is_empty());
+        let turn = &log_lines(&log, "turn")[0];
+        assert_eq!((turn["via"].as_str(), turn["end"].as_str(), turn["stt"].as_str()), (Some("voice"), Some("sound"), Some("final")), "{turn:?}");
+        let times: Vec<u64> = MARKS.iter().map(|k| turn.get(*k).and_then(Value::as_u64).unwrap_or_else(|| panic!("no {k}: {turn:?}"))).collect();
+        assert!(times.windows(2).all(|w| w[0] <= w[1]), "in order: {turn:?}");
+        // The first chunk ended at the sentence: the comma came before FIRST_MIN
+        assert_eq!((turn["engine"].as_str(), turn["chunk_chars"].as_u64()), (Some("aivis"), Some(13)));
+
+        let phrases = c.speaker.phrases.clone().unwrap();
+        wait_for("the phrase cache is built", || phrases.ready() == fixed_phrases().len());
+        wait_for("the reply is over", || !c.speaker.speaking());
+        c.set_mic(false);
+        wait_for("the phrase is written", || !log_lines(&log, "phrase").is_empty());
+        let phrase = &log_lines(&log, "phrase")[0];
+        assert_eq!(phrase["text"].as_str(), Some(MIC_OFF_SAID));
+        assert!(phrase["ms"].as_u64().unwrap() < 100, "{phrase:?}");
+        assert!(aivis.synths.lock().unwrap().iter().filter(|t| *t == MIC_OFF_SAID).count() == 1, "made once, for the cache");
+        c.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// How the controller ends turns in the latency log: a command, a request
+    /// with no claude, an answer to an approval and the reply it came in
+    /// before; a message sent while Claude is at a reply (busy), a reply with
+    /// speech off (silent), one stopped, and the app closing.
+    #[test]
+    fn turns_end_in_the_latency_log() {
+        let dir = std::env::temp_dir().join(format!("va-ends-{}-{}", std::process::id(), unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let log = dir.join("latency.jsonl");
+        let (c, _) = controller_with(Hooks { latency_log: Some(log.clone()), ..Hooks::default() }, &dir);
+        let ends = || log_lines(&log, "turn").iter().map(|l| l["end"].as_str().unwrap_or_default().to_string()).collect::<Vec<_>>();
+        c.handle_user_text("止めて。", "text");
+        c.handle_user_text("こんにちは", "text");
+        assert_eq!(ends(), ["command", "error"]);
+
+        c.open_claude(fake_claude(&dir, "0.8"), Vec::new(), Vec::new());
+        c.handle_user_text("一つ目", "text");
+        c.handle_user_text("二つ目", "text");
+        wait_for("the first reply is over", || ends().len() == 4);
+        assert_eq!(ends()[2..], ["busy", "silent"], "the first keeps its own times");
+        wait_for("claude is free", || !c.claude().unwrap().busy());
+
+        c.handle_user_text("三つ目", "text");
+        c.hush();
+        assert_eq!(ends().last().map(String::as_str), Some("stopped"));
+        wait_for("claude is free", || !c.claude().unwrap().busy());
+
+        c.handle_user_text("四つ目", "text");
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        c.handle_user_text("はい", "voice");
+        assert_eq!(asked.join().unwrap()["behavior"], "allow");
+        assert_eq!(ends()[5..], ["approval", "approval"], "the reply it came before, and the answer");
+        wait_for("claude is free", || !c.claude().unwrap().busy());
+
+        // Claude says it is free a moment before the end of its reply is
+        // handled: a message sent then does not take that end as its own
+        let ending = c.latency.begin("text", Instant::now());
+        c.latency.replying_to(ending);
+        c.handle_user_text("五つ目", "text");
+        c.latency.reply_ended(false);
+        assert_eq!(ends()[7..], ["busy", "silent"]);
+        wait_for("claude is free", || !c.claude().unwrap().busy());
+
+        let open = c.latency.begin("voice", Instant::now());
+        c.close();
+        assert!(!c.latency.is_open(open));
+        assert_eq!(ends().last().map(String::as_str), Some("quit"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Talking to answer an approval silences the speech (as any talking
+    /// does); the answer lets the rest of the turn be heard again, by voice
+    /// as by the keyboard. 「静かにして」 while it waits only quiets.
+    #[test]
+    fn an_answer_lets_the_rest_be_heard() {
+        let (c, _) = controller();
+        let ask = || {
+            let c2 = c.clone();
+            std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))))
+        };
+        let asked = ask();
+        wait_status(&c, "CONFIRM");
+        c.hush(); // what Space does
+        c.handle_user_text("はい", "voice");
+        assert_eq!(asked.join().unwrap()["behavior"], "allow");
+        assert!(!c.lock().hushed, "the rest of the reply is heard");
+
+        let asked = ask();
+        wait_status(&c, "CONFIRM");
+        c.handle_user_text("静かにして", "voice");
+        assert!(c.lock().hushed);
+        assert!(c.answer_approval(false));
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+        assert!(!c.lock().hushed);
     }
 
     #[test]

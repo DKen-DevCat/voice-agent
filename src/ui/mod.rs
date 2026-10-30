@@ -35,7 +35,6 @@ pub trait Assistant: Send + Sync {
     fn recording(&self) -> bool;
     fn level(&self) -> f64;
     fn send_text(&self, text: &str);
-    fn warm(&self);
     fn abort(&self);
     fn answer_approval(&self, allow: bool) -> bool;
     fn set_mic(&self, on: bool);
@@ -61,9 +60,6 @@ impl Assistant for Arc<Controller> {
         // Sending may have to start claude; the UI does not wait for it
         let (c, text) = (self.clone(), text.to_string());
         std::thread::spawn(move || c.handle_user_text(&text, "text"));
-    }
-    fn warm(&self) {
-        Controller::warm(self);
     }
     fn abort(&self) {
         let c = self.clone();
@@ -478,7 +474,6 @@ pub mod tests {
         fn send_text(&self, text: &str) {
             self.call(format!("send {text}"));
         }
-        fn warm(&self) {}
         fn abort(&self) {
             self.call("abort".into());
         }

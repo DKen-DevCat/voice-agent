@@ -6,6 +6,7 @@ mod agent;
 mod app;
 mod audio;
 mod config;
+mod latency;
 mod log;
 mod net;
 mod shell;

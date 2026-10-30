@@ -136,6 +136,23 @@ fn risky() -> &'static Vec<(Regex, &'static str)> {
     })
 }
 
+/// Why raw keystrokes into a shell are asked.
+const INPUT_REASON: &str = "シェルに直接入力します";
+/// Why a tool that may write outside the working directory is asked.
+const OUTSIDE_REASON: &str = "作業ディレクトリの外を変更する可能性があります";
+
+/// Every reason a call can be asked for, once each (the phrase cache says
+/// them). A question names several joined by "、", so none contains one.
+pub fn ask_reasons() -> Vec<&'static str> {
+    let mut out: Vec<&'static str> = Vec::new();
+    for why in risky().iter().map(|(_, w)| *w).chain([INPUT_REASON, OUTSIDE_REASON]) {
+        if !out.contains(&why) {
+            out.push(why);
+        }
+    }
+    out
+}
+
 pub struct DenyRule {
     pub rule: String,
     pub re: Regex,
@@ -244,11 +261,11 @@ pub fn decide(tool: &str, input: &Map<String, Value>, deny: &[DenyRule]) -> Deci
         // Raw keystrokes into a shell: always asked, unless they are forbidden anyway
         SHELL_INPUT => match check_command(s("text"), deny) {
             d @ Decision::Deny(_) => d,
-            _ => Decision::Ask("シェルに直接入力します".to_string()),
+            _ => Decision::Ask(INPUT_REASON.to_string()),
         },
         _ if AUTO_ALLOW.contains(&tool) => Decision::Allow,
         // e.g. Edit/Write outside the working directory (acceptEdits covers the inside)
-        _ => Decision::Ask("作業ディレクトリの外を変更する可能性があります".to_string()),
+        _ => Decision::Ask(OUTSIDE_REASON.to_string()),
     }
 }
 
@@ -413,6 +430,27 @@ mod tests {
         // Every reason is said, not only the first
         let Decision::Ask(why) = check_command("git push origin main && wrangler deploy", &[]) else { panic!() };
         assert_eq!(why, "リモートへ push します、外部サービスへ変更を反映します");
+    }
+
+    /// Every reason a question can give is in ask_reasons (which the phrase
+    /// cache says), once, and none contains the "、" that joins several.
+    #[test]
+    fn every_reason_is_listed() {
+        let reasons = ask_reasons();
+        assert_eq!(reasons.len(), 19, "17 for commands, raw input, outside the working directory");
+        assert!(reasons.iter().all(|r| !r.contains('、') && !r.is_empty()), "{reasons:?}");
+        let mut seen = reasons.clone();
+        seen.sort();
+        seen.dedup();
+        assert_eq!(seen.len(), reasons.len());
+        for (tool, input) in [
+            (SHELL_RUN, input("command", "git push origin main && wrangler deploy && sudo ls")),
+            (SHELL_INPUT, input("text", "y")),
+            ("Write", input("file_path", "/etc/hosts")),
+        ] {
+            let Decision::Ask(why) = decide(tool, &input, &[]) else { panic!("{tool} is asked") };
+            assert!(why.split('、').all(|w| reasons.contains(&w)), "{why}");
+        }
     }
 
     #[test]

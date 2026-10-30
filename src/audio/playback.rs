@@ -69,17 +69,20 @@ fn resample(samples: &[i16], from: u32, to: u32) -> Vec<i16> {
 type Done = Box<dyn FnOnce() + Send>;
 
 /// What the device callback drains: the queued samples and, for each clip,
-/// what to call once the device has been handed all of it.
+/// what to call once the device has been handed its first sample, and all
+/// of it.
 #[derive(Default)]
 struct Queue {
     buf: VecDeque<i16>,
     read: u64,  // samples handed to the device
     write: u64, // samples appended
+    starts: VecDeque<(u64, Done)>,
     marks: VecDeque<(u64, Done)>,
 }
 
 impl Queue {
-    fn add(&mut self, samples: &[i16], done: Done) {
+    fn add(&mut self, samples: &[i16], started: Done, done: Done) {
+        self.starts.push_back((self.write, started));
         self.buf.extend(samples);
         self.write += samples.len() as u64;
         self.marks.push_back((self.write, done));
@@ -99,16 +102,21 @@ impl Queue {
             frame.fill(v);
         }
         let mut fired = Vec::new();
+        while self.starts.front().is_some_and(|(start, _)| *start < self.read) {
+            fired.push(self.starts.pop_front().unwrap().1);
+        }
         while self.marks.front().is_some_and(|(end, _)| *end <= self.read) {
             fired.push(self.marks.pop_front().unwrap().1);
         }
         fired
     }
 
-    /// Discards everything not yet played; returns what to call now.
+    /// Discards everything not yet played; returns what to call now (the
+    /// clips that never started are not reported as started).
     fn drop_all(&mut self) -> Vec<Done> {
         self.buf.clear();
         self.read = self.write;
+        self.starts.clear();
         self.marks.drain(..).map(|(_, d)| d).collect()
     }
 }
@@ -193,9 +201,11 @@ impl PcmPlayer {
         Ok(())
     }
 
-    /// Appends a clip after whatever is still playing; done is called once it
-    /// has been played (or dropped). Nothing is queued once cancel is set.
-    pub fn enqueue(&self, cancel: &Cancel, pcm: &Pcm, done: impl FnOnce() + Send + 'static) -> Result<(), String> {
+    /// Appends a clip after whatever is still playing. started is called
+    /// from the device's callback when its first sample goes to the device,
+    /// done once all of it has (or it was dropped). Nothing is queued once
+    /// cancel is set.
+    pub fn enqueue(&self, cancel: &Cancel, pcm: &Pcm, started: impl FnOnce() + Send + 'static, done: impl FnOnce() + Send + 'static) -> Result<(), String> {
         let mut dev = self.dev.lock().unwrap_or_else(|e| e.into_inner());
         if let Err(e) = self.run(&mut dev) {
             self.failed.store(true, Ordering::SeqCst);
@@ -208,7 +218,7 @@ impl PcmPlayer {
             done();
             return Ok(());
         }
-        self.queue.lock().unwrap_or_else(|e| e.into_inner()).add(&samples, Box::new(done));
+        self.queue.lock().unwrap_or_else(|e| e.into_inner()).add(&samples, Box::new(started), Box::new(done));
         Ok(())
     }
 
@@ -281,14 +291,44 @@ mod tests {
         assert_eq!(resample(&[0; 44100], 44100, 48000).len(), 48000);
     }
 
+    /// Plays a tenth of a second of silence through the real output device,
+    /// started from stopped as for a cached phrase, and measures how soon its
+    /// first sample went out: `VA_LIVE_AUDIO=1 cargo test live_ -- --nocapture`
+    #[test]
+    fn live_first_sample_within_100ms() {
+        if std::env::var("VA_LIVE_AUDIO").is_err() {
+            return;
+        }
+        let p = Arc::new(PcmPlayer::default());
+        p.prepare().expect("output device");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let pcm = Pcm { samples: vec![0; 4410], rate: 44100 };
+        let t0 = std::time::Instant::now();
+        p.enqueue(
+            &Cancel::new(),
+            &pcm,
+            move || {
+                let _ = tx.send(std::time::Instant::now());
+            },
+            || {},
+        )
+        .unwrap();
+        let took = rx.recv_timeout(Duration::from_secs(2)).expect("never started") - t0;
+        println!("first sample after {took:?} (device at {} Hz)", p.rate());
+        assert!(took < Duration::from_millis(100), "{took:?}");
+        p.close();
+    }
+
     #[test]
     fn queue_plays_clips_in_order() {
         let mut q = Queue::default();
         let fired = Arc::new(AtomicUsize::new(0));
+        let started = Arc::new(Mutex::new(Vec::new()));
         for n in [4usize, 2] {
-            let f = fired.clone();
+            let (f, s) = (fired.clone(), started.clone());
             q.add(
                 &vec![16384; n],
+                Box::new(move || s.lock().unwrap().push(n)),
                 Box::new(move || {
                     f.fetch_add(1, Ordering::SeqCst);
                 }),
@@ -304,18 +344,22 @@ mod tests {
         run(&mut q, &mut out);
         assert_eq!(out, [0.5; 6]);
         assert_eq!(fired.load(Ordering::SeqCst), 0, "the first clip has a sample left");
+        assert_eq!(*started.lock().unwrap(), [4], "the first clip has started, the second not");
         let mut out = [9.0f32; 4];
         run(&mut q, &mut out);
         assert_eq!(fired.load(Ordering::SeqCst), 1);
+        assert_eq!(*started.lock().unwrap(), [4, 2], "its first sample went out with the first clip's last");
         let mut out = [9.0f32; 6];
         run(&mut q, &mut out);
         assert_eq!(out, [0.5, 0.5, 0.0, 0.0, 0.0, 0.0]);
         assert_eq!(fired.load(Ordering::SeqCst), 2);
 
-        // Dropping calls what was waiting
-        let f = fired.clone();
+        // Dropping calls what was waiting, but a clip dropped before it began
+        // never started
+        let (f, s) = (fired.clone(), started.clone());
         q.add(
             &[1; 100],
+            Box::new(move || s.lock().unwrap().push(100)),
             Box::new(move || {
                 f.fetch_add(1, Ordering::SeqCst);
             }),
@@ -324,6 +368,7 @@ mod tests {
             d();
         }
         assert_eq!(fired.load(Ordering::SeqCst), 3);
+        assert_eq!(*started.lock().unwrap(), [4, 2]);
         assert!(q.buf.is_empty() && q.read == q.write);
     }
 }
