@@ -327,11 +327,12 @@ pub fn guard(tool: &str, input: &Map<String, Value>, g: &Guarded, wd: Option<&st
 fn command_touches(cmd: &str, g: &Guarded) -> bool {
     static SUB: OnceLock<Regex> = OnceLock::new();
     let sub = SUB.get_or_init(|| Regex::new(&format!(r"(?i)\bvoice-agent\b{REST}\b(?:pair|unpair|serve)\b")).unwrap());
-    if sub.is_match(cmd) {
+    if sub.is_match(&fold(cmd)) {
         return true;
     }
     let home = home_dir();
-    g.paths.iter().any(|p| mentions(cmd, p, &home)) || g.names.iter().any(|re| re.is_match(cmd))
+    let folded = fold(cmd);
+    g.paths.iter().any(|p| mentions(cmd, p, &home)) || g.names.iter().any(|re| re.is_match(&folded))
 }
 
 /// Whether cmd names p in full, or from ~ or $HOME.
@@ -345,19 +346,47 @@ fn mentions(cmd: &str, p: &Path, home: &Path) -> bool {
     }
     // macOS volumes are case-insensitive by default: ~/wken-agents is
     // ~/WKEN-AGENTS (the original text is kept for messages)
-    let cmd = cmd.to_lowercase();
-    forms.iter().any(|f| cmd.contains(f.to_lowercase().as_str()))
+    let cmd = fold(cmd);
+    forms.iter().any(|f| cmd.contains(fold(f).as_str()))
 }
 
-/// p with every component lowercased, for comparing only.
-fn fold(p: &Path) -> std::path::PathBuf {
-    p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+/// Text folded for comparing only (never shown). APFS compares names by
+/// Unicode full case folding, not just lowercase: checked on this Mac on
+/// 2026-10-31 by making folders and testing other spellings, `WKEN-AGENTſ`
+/// (long s), `lfm3-vl-ſerver` and `.conﬁg` (the fi ligature) were the same
+/// folders as the plain ones, while `voİce-agent`, `voıce-agent`, fullwidth
+/// letters and `WKEN-AGENﬆ`/`lﬀm3` (which fold to other letters) were not.
+/// Every protected name is ASCII, so what matters is each entry of Unicode's
+/// CaseFolding.txt whose fold is ASCII; this table has them all (the rest of
+/// the folding is `to_lowercase`, which already maps the Kelvin sign to k).
+pub fn fold(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '\u{17F}' => out.push('s'),
+            '\u{212A}' => out.push('k'),
+            '\u{DF}' | '\u{1E9E}' => out.push_str("ss"),
+            '\u{FB00}' => out.push_str("ff"),
+            '\u{FB01}' => out.push_str("fi"),
+            '\u{FB02}' => out.push_str("fl"),
+            '\u{FB03}' => out.push_str("ffi"),
+            '\u{FB04}' => out.push_str("ffl"),
+            '\u{FB05}' | '\u{FB06}' => out.push_str("st"),
+            c => out.extend(c.to_lowercase()),
+        }
+    }
+    out
+}
+
+/// p with every component folded, for comparing only.
+fn fold_path(p: &Path) -> std::path::PathBuf {
+    p.components().map(|c| fold(&c.as_os_str().to_string_lossy())).collect()
 }
 
 /// Whether `inner` is `outer` or below it, by whole components, ignoring
 /// case (the Mac's volume does). Both should be resolved already.
 pub fn is_inside(inner: &Path, outer: &Path) -> bool {
-    fold(inner).starts_with(fold(outer))
+    fold_path(inner).starts_with(fold_path(outer))
 }
 
 fn path_inside(target: &str, g: &Guarded) -> bool {
@@ -552,6 +581,38 @@ mod tests {
         // under serve a lowercase name alone is enough, a longer name is not
         let serve = guarded(true);
         for cmd in ["cd .. && sed -i '' s/a/b/ wken-agents/server/app.py", "ls /x/Voice-Agent", "ls LFM3-VL-SERVER", "Voice-Agent PAIR 1"] {
+            assert!(guard(SHELL_RUN, &input("command", cmd), &serve, None).is_some(), "{cmd}");
+        }
+        assert!(guard(SHELL_RUN, &input("command", "ls wken-agents-notes"), &serve, None).is_none());
+    }
+
+    #[test]
+    fn the_guard_follows_apfs_full_case_folding() {
+        // checked on the Mac on 2026-10-31: these spellings are the same
+        // folders (ſ folds to s, the fi ligature to fi, the Kelvin sign to k)
+        let home = home_dir().to_string_lossy().into_owned();
+        assert_eq!(fold("WKEN-AGENTſ"), "wken-agents");
+        assert_eq!(fold(".CONﬁG"), ".config");
+        for names in [false, true] {
+            let g = guarded(names);
+            for p in ["WKEN-AGENTſ/x", "wken-agentſ/x", "lfm3-vl-ſerver/x", ".conﬁg/voice-agent/devices.json", ".CONﬁG/voice-agent/x", "W\u{212A}EN-AGENTS/x"] {
+                for (tool, k) in [("Write", "file_path"), ("Edit", "file_path"), ("MultiEdit", "file_path")] {
+                    let v = format!("{home}/{p}");
+                    assert!(guard(tool, &input(k, &v), &g, None).is_some(), "{tool} {v}");
+                }
+                for cmd in [format!("echo x >> {home}/{p}"), format!("rm ~/{p}")] {
+                    assert!(guard(SHELL_RUN, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
+                }
+                let dir = format!("{home}/{p}");
+                assert!(guard(SHELL_NEW, &input("dir", &dir), &g, Some(&dir)).is_some(), "{dir}");
+            }
+            // names that fold to something else are other folders
+            for p in ["WKEN-AGENﬆ/x", "voİce-agent/x", "voıce-agent/x", "Ｗken-agents/x", "wken-agents-notes/x"] {
+                assert!(guard("Write", &input("file_path", &format!("{home}/{p}")), &g, None).is_none(), "{p}");
+            }
+        }
+        let serve = guarded(true);
+        for cmd in ["sed -i '' s/a/b/ wken-agentſ/server/app.py", "ls ~/lfm3-vl-ſerver", "cat a > .conﬁg/voice-agent/devices.json"] {
             assert!(guard(SHELL_RUN, &input("command", cmd), &serve, None).is_some(), "{cmd}");
         }
         assert!(guard(SHELL_RUN, &input("command", "ls wken-agents-notes"), &serve, None).is_none());

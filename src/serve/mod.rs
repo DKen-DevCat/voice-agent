@@ -715,6 +715,11 @@ done
             assert!(check_workdir(&home.join(p), &guarded).is_err(), "{p}");
         }
         assert!(check_workdir(&home.join("wken-agents-notes"), &guarded).is_ok());
+        // APFS folds the full way (checked 2026-10-31): the long s and the fi ligature
+        for p in ["WKEN-AGENTſ", "wken-agentſ/x", "lfm3-vl-ſerver", ".conﬁg/voice-agent", ".CONﬁG/voice-agent/x"] {
+            assert!(check_workdir(&home.join(p), &guarded).is_err(), "{p}");
+        }
+        assert!(check_workdir(&home.join("WKEN-AGENﬆ"), &guarded).is_ok());
         assert!(check_workdir(&home.join("voice-agent/sub"), &guarded).is_err());
         assert!(check_workdir(&home, &guarded).is_err(), "home holds them all");
         assert!(check_workdir(Path::new("/"), &guarded).is_err());

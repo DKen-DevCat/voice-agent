@@ -66,7 +66,7 @@
 - N2 の設計（native-app.md §14）で詰めたこと: 許可は承認の鍵（Face ID かパスコード）の署名だけで、メッセージの「はい」は iPhone に署名を求めるだけ。どの要求も serve の起動の番号を署名に含める。serve の作業フォルダは必須で、信頼の土台（voice-agent・lfm3-vl-server・WKEN-AGENTS・設定の場所）の外。固定の禁止（設定・`control.sock`・信頼の土台への書き込み、`voice-agent pair`・`unpair`・`serve`）はすべてのツールに効かせる。N2a（serve の本体）は README の「iPhone アプリから使う」
 - エージェントの会話は何本でも作れる。iPhone が持つのは voice-agent が作った会話の番号で、voice-agent が Claude Code のセッション ID（返答のたびに変わりうる）との対応を持つ。同時に動くのは 1 本で、会話を移るときは `--resume`。会話の記録は iPhone が持つ
 - 信頼の土台の名前（2026-10-31 追記）: lfm3-vl-server のフォルダは `~/WKEN-AGENTS` へ改名される。改名で守りが黙って外れないよう、`protect` の既定・固定の書き込み禁止・serve の作業フォルダの検査に `~/WKEN-AGENTS` を足した。移行の間のため `~/lfm3-vl-server` も残してあり、改名が済んだら外してよい
-- 大文字小文字（2026-10-31 追記）: Mac のボリュームは大文字小文字を区別しないので、信頼の土台の判定（書き込み禁止、コマンドの中の名前、`job_start`・`shell_new` の場所、serve の作業フォルダ）は小文字にそろえて比べる。比べる時だけそろえ、メッセージには元の綴りを使う。境目は今までどおり、フォルダ名の区切り（`wken-agents-notes` は別のフォルダ）
+- 大文字小文字（2026-10-31 追記）: Mac のボリュームは大文字小文字を区別しないので、信頼の土台の判定（書き込み禁止、コマンドの中の名前、`job_start`・`shell_new` の場所、serve の作業フォルダ）は畳み込んで比べる。APFS は小文字だけでなく Unicode の完全な畳み込み（full case folding）で比べる（2026-10-31 に Mac で実測: `WKEN-AGENTſ`・`lfm3-vl-ſerver`・`.conﬁg` は同じフォルダ、`voİce-agent`・全角・`WKEN-AGENﬆ` は別のフォルダ）。守る名前はすべて ASCII なので、畳むと ASCII になる CaseFolding の項目（ſ ß ẞ K ﬀ〜ﬆ）の表を持ち、残りは `to_lowercase`。比べる時だけそろえ、メッセージには元の綴りを使う。境目は今までどおり、フォルダ名の区切り（`wken-agents-notes` は別のフォルダ）
 - ターミナルの画面は開発用に残す。serve とは同時に動かさない
 - P2〜P6（常時待ち受け、話者認証、割り込み、エコー除去）は、マイクが iPhone に移るので、native-app.md の N4 で組み直す
 
