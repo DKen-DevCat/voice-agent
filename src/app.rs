@@ -7,7 +7,7 @@ use std::ffi::OsString;
 use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard, Weak, mpsc};
+use std::sync::{Arc, Mutex, MutexGuard, OnceLock, Weak, mpsc};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
@@ -113,6 +113,13 @@ pub struct Event {
     pub reason: String, // why an approval is needed
     pub allow: bool,
     pub state: String, // Status
+    /// User: what became of the text (native-app.md §18.3.1 S6): `sent` to
+    /// Claude, `dropped` (answered with a notice while an approval waits, or
+    /// Claude is not there), or `command` (taken as a command or as the
+    /// answer to an approval, which Claude never sees). The app counts only
+    /// `sent` as delivered.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub fate: String,
     /// ApprovalResolved: what answered it (user / button / message / timeout / stop)
     #[serde(skip_serializing_if = "String::is_empty")]
     pub by: String,
@@ -226,6 +233,9 @@ pub struct Controller {
     shells: Registry,
     jobs: Jobs,
     deny: Vec<DenyRule>,
+    /// Told every Claude session id the moment it is learned (serve records
+    /// them; the 1-second poll would miss one replaced within a second)
+    on_session: OnceLock<Box<dyn Fn(&str) + Send + Sync>>,
     runtime_dir: PathBuf,
     level: Arc<AtomicU64>, // mic level (f64 bits)
     st: Mutex<State>,
@@ -338,6 +348,7 @@ impl Controller {
                 shells,
                 jobs,
                 deny,
+                on_session: OnceLock::new(),
                 runtime_dir,
                 level,
                 st: Mutex::new(State::default()),
@@ -477,6 +488,11 @@ impl Controller {
         let cb = Callbacks {
             on_ready: Box::new(move |id, model| {
                 log(&format!("claude session {id} ({model})"));
+                w1(&|c| {
+                    if let Some(f) = c.on_session.get() {
+                        f(id);
+                    }
+                });
                 w1(&|c| c.emit(Event::new(EventKind::System, format!("Claude につながりました // {model}"))));
             }),
             on_text: Box::new(move |t| {
@@ -759,9 +775,11 @@ impl Controller {
     /// A message from the iPhone (serve). saw: whether the sender had seen
     /// the approval with this id when they began it (native-app.md §14.9).
     /// Gives its turn in the latency log.
-    pub fn handle_message(self: &Arc<Self>, text: &str, via: &str, saw: &dyn Fn(&str) -> bool) -> u64 {
+    /// raw: the text is not a command to look for (「止めて」 goes to Claude
+    /// as text); an answer to an approval is still an answer (S6).
+    pub fn handle_message(self: &Arc<Self>, text: &str, via: &str, raw: bool, saw: &dyn Fn(&str) -> bool) -> u64 {
         let turn = if text.trim().is_empty() { 0 } else { self.latency.begin(via, Instant::now()) };
-        self.heard(text, via, turn, &|a: &Approval| saw(&a.id));
+        self.heard(text, via, raw, turn, &|a: &Approval| saw(&a.id));
         turn
     }
 
@@ -771,27 +789,39 @@ impl Controller {
     fn handle_heard(self: &Arc<Self>, text: &str, via: &str, began: Instant, turn: u64) {
         // Only one begun after the approval was raised answers it (not a
         // request that was under way)
-        self.heard(text, via, turn, &|a: &Approval| a.at <= began);
+        self.heard(text, via, false, turn, &|a: &Approval| a.at <= began);
     }
 
     /// As handle_heard; after: whether the text was begun after an approval.
-    fn heard(self: &Arc<Self>, text: &str, via: &str, turn: u64, after: &dyn Fn(&Approval) -> bool) {
+    fn heard(self: &Arc<Self>, text: &str, via: &str, raw: bool, turn: u64, after: &dyn Fn(&Approval) -> bool) {
         let text = text.trim();
         if text.is_empty() {
             return;
         }
-        self.emit(Event { via: via.to_string(), ..Event::new(EventKind::User, text) });
-
-        let cmd = commands::parse(text);
+        let cmd = if raw { None } else { commands::parse(text) };
         let first = {
             let st = self.lock();
             st.approvals.first().map(|a| (a.id.clone(), after(a)))
         };
-        if let Some((id, after)) = first {
-            self.latency.finish(turn, "approval");
+        // What becomes of the text is known before the user event goes out,
+        // which says it (the app counts only `sent` as delivered)
+        let answer = match &first {
             // Only a clear yes or no answers it. 「生成もストップ」 refuses it
             // with everything else; 「静かにして」 only quiets.
-            let answer = if after && cmd != Some(Command::StopAll) { parse_consent(text) } else { None };
+            Some((_, true)) if cmd != Some(Command::StopAll) => parse_consent(text),
+            _ => None,
+        };
+        let fate = match (&first, answer, cmd) {
+            (Some(_), None, None) => "dropped",
+            (Some(_), _, _) => "command",
+            (None, _, Some(_)) => "command",
+            (None, _, None) if self.claude().is_none() => "dropped",
+            (None, _, None) => "sent",
+        };
+        self.emit(Event { via: via.to_string(), fate: fate.to_string(), ..Event::new(EventKind::User, text) });
+
+        if let Some((id, _)) = first {
+            self.latency.finish(turn, "approval");
             match (answer, cmd) {
                 // Under serve a message is signed with the device key, which a
                 // rebuilt app can use without Face ID: only the approval key
@@ -978,6 +1008,11 @@ impl Controller {
     /// Claude's id for the conversation under way (empty before its first reply).
     pub fn session_id(&self) -> String {
         self.claude().map(|c| c.session_id()).unwrap_or_default()
+    }
+
+    /// Sets what is told each session id as it is learned (once).
+    pub fn set_on_session(&self, f: Box<dyn Fn(&str) + Send + Sync>) {
+        let _ = self.on_session.set(f);
     }
 
     /// How many subagents and jobs are at work.
@@ -1509,17 +1544,17 @@ mod tests {
         let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
         wait_status(&c, "CONFIRM");
         // a message is signed with the device key: its yes does not allow
-        c.handle_message("はい", "text", &|_| true);
+        c.handle_message("はい", "text", false, &|_| true);
         assert_eq!(c.status_now(), "CONFIRM");
         assert!(!asked.is_finished());
         let confirm = kinds(&events, EventKind::ApprovalConfirm);
         assert_eq!(confirm.len(), 1);
         assert_eq!(confirm[0].id, "ap1");
         // begun before the approval was seen: not an answer
-        c.handle_message("いいえ", "text", &|_| false);
+        c.handle_message("いいえ", "text", false, &|_| false);
         assert_eq!(c.status_now(), "CONFIRM");
         // a no is safe, and taken
-        c.handle_message("いいえ", "text", &|id| id == "ap1");
+        c.handle_message("いいえ", "text", false, &|id| id == "ap1");
         assert_eq!(asked.join().unwrap()["behavior"], "deny");
         let resolved = kinds(&events, EventKind::ApprovalResolved);
         assert_eq!((resolved[0].allow, resolved[0].by.as_str()), (false, "message"));
@@ -1998,6 +2033,123 @@ mod tests {
         assert!(!c.lock().hushed);
     }
 
+    /// A claude stand-in that writes down every line it is sent (in.log) and
+    /// answers 了解.
+    fn recording_claude(dir: &Path) -> PathBuf {
+        let path = dir.join("claude");
+        let script = format!(
+            "#!/bin/sh\nwhile IFS= read -r line; do\n  printf '%s\\n' \"$line\" >> {log}\n  printf '%s\\n' '{{\"type\":\"system\",\"subtype\":\"init\",\"session_id\":\"s1\",\"model\":\"fake\"}}'\n  printf '%s\\n' '{{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"了解\",\"session_id\":\"s1\"}}'\ndone\n",
+            log = dir.join("in.log").display()
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn users(events: &Mutex<Vec<Event>>) -> Vec<(String, String)> {
+        kinds(events, EventKind::User).into_iter().map(|e| (e.text, e.fate)).collect()
+    }
+
+    /// S6 (native-app.md §18.3.1): the app sends typed text with raw:true,
+    /// and 「止めて」 then reaches Claude as text; without it the same word is
+    /// a command and Claude never sees it. The user event says which.
+    #[test]
+    fn raw_text_sends_command_words_to_claude() {
+        let dir = std::env::temp_dir().join(format!("va-raw-{}-{}", std::process::id(), unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, events) = controller_with(Hooks::default(), &dir);
+        c.open_claude(recording_claude(&dir), Vec::new(), Vec::new());
+        let sent = || std::fs::read_to_string(dir.join("in.log")).unwrap_or_default();
+        let none = |_: &str| false;
+
+        // raw: every one of them goes to Claude as it was typed
+        for (i, word) in ["止めて", "ストップ", "生成もストップ", "マイク切って"].iter().enumerate() {
+            c.handle_message(word, "text", true, &none);
+            wait_for("claude has the text", || sent().lines().count() == i + 1);
+            assert!(sent().lines().nth(i).unwrap().contains(word), "{word}");
+            wait_for("claude is free", || !c.claude().unwrap().busy());
+        }
+        assert!(users(&events).iter().all(|(_, fate)| fate == "sent"), "{:?}", users(&events));
+        assert_ne!(c.status_now(), "MIC_OFF", "「マイク切って」 typed raw does not turn the mic off");
+
+        // as before: no raw, the word is a command, and Claude hears nothing more
+        c.handle_message("止めて", "text", false, &none);
+        c.handle_message("生成もストップ", "text", false, &none);
+        c.handle_message("マイク切って", "text", false, &none);
+        let last3: Vec<String> = users(&events)[4..].iter().map(|(_, f)| f.clone()).collect();
+        assert_eq!(last3, ["command"; 3]);
+        assert_eq!(sent().lines().count(), 4);
+
+        // an ordinary text is `sent` either way
+        c.handle_message("テストを実行して", "text", false, &none);
+        assert_eq!(users(&events).last().unwrap().1, "sent");
+        c.close();
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The fate of a text while an approval waits: a yes or no is taken
+    /// (`command`: Claude never sees it); any other text is answered with the
+    /// notice and dropped, raw or not; so is a yes or no from one who had not
+    /// seen the approval.
+    #[test]
+    fn fate_while_an_approval_waits() {
+        let (c, events) = controller();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        let seen = |_: &str| true;
+
+        c.handle_message("ついでに別のことも", "text", true, &seen);
+        c.handle_message("ついでに別のことも", "text", false, &seen);
+        // an answer from one who had not seen the approval is not an answer
+        c.handle_message("いいえ", "text", true, &|_| false);
+        assert!(users(&events).iter().all(|(_, fate)| fate == "dropped"), "{:?}", users(&events));
+        assert_eq!(kinds(&events, EventKind::Notice).len(), 3, "each is answered with the notice");
+        assert_eq!(c.status_now(), "CONFIRM", "the approval is still waiting");
+
+        // Found: 「止めて」 is a no to an approval (parse_consent), raw or
+        // not, so raw does not keep it from refusing; it is consumed
+        c.handle_message("止めて", "text", true, &seen);
+        assert_eq!(users(&events).last().unwrap().1, "command");
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+        assert_eq!(kinds(&events, EventKind::ApprovalResolved).last().unwrap().by, "user");
+    }
+
+    /// 「生成もストップ」 refuses an approval with everything else (not raw):
+    /// consumed as a command, whatever the consent parse would say.
+    #[test]
+    fn stop_all_not_raw_while_an_approval_waits_is_a_command() {
+        let (c, events) = controller();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        c.handle_message("生成もストップ", "text", false, &|_| true);
+        assert_eq!(users(&events), [("生成もストップ".to_string(), "command".to_string())]);
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+    }
+
+    /// A yes or no is the answer to the approval, raw or not.
+    #[test]
+    fn a_no_answers_the_approval_even_when_raw() {
+        let (c, events) = controller();
+        let c2 = c.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "git push origin main"}}))));
+        wait_status(&c, "CONFIRM");
+        c.handle_message("いいえ", "text", true, &|_| true);
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+        assert_eq!(users(&events), [("いいえ".to_string(), "command".to_string())]);
+    }
+
+    /// The user event carries fate; the other events do not.
+    #[test]
+    fn only_the_user_event_has_a_fate() {
+        let user = serde_json::to_value(Event { fate: "sent".into(), ..Event::new(EventKind::User, "x") }).unwrap();
+        assert_eq!(user["fate"], "sent");
+        let notice = serde_json::to_value(Event::new(EventKind::Notice, "x")).unwrap();
+        assert!(notice.get("fate").is_none());
+    }
+
     #[test]
     fn typed_text_without_claude_is_an_error() {
         let (c, events) = controller();
@@ -2006,6 +2158,8 @@ mod tests {
         c.handle_user_text("こんにちは", "text");
         let evs = events.lock().unwrap();
         assert_eq!((evs[0].kind, evs[0].via.as_str()), (EventKind::User, "text"));
+        // it did not reach Claude (S6)
+        assert_eq!(evs[0].fate, "dropped");
         assert_eq!(evs[1].kind, EventKind::Error);
     }
 }

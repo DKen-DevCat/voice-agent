@@ -125,7 +125,9 @@ fn handle(s: &Serve, mut req: Request) {
             Ok(v) => {
                 let text = v["text"].as_str().unwrap_or_default();
                 let via = v["via"].as_str().filter(|v| *v == "text" || *v == "voice").unwrap_or("text");
-                match s.message(&id, text, via, v["last_event"].as_str()) {
+                // true is the app's: its text is never a command (S6)
+                let raw = v["raw"].as_bool().unwrap_or(false);
+                match s.message(&id, text, via, raw, v["last_event"].as_str()) {
                     Ok(turn) => (200, json!({"turn": turn})),
                     Err(e) => e,
                 }

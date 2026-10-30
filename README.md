@@ -112,7 +112,7 @@ Claude は Bash を使わず、voice-agent の裏のシェルのツール（`mcp
 `serve` は設定と同じ場所（`~/.config/voice-agent/`）にも置きます（どれも 0600。キャッシュと違って消されないように）:
 
 - `devices.json`: 対にした iPhone の 2 つの公開鍵と、対にした・解いた履歴
-- `sessions.json`: 会話の番号と、Claude Code のセッション ID の対応
+- `sessions.json`: 会話の番号と、Claude Code のセッション ID の対応。開き直す（`--resume`）とセッション ID が変わるので、会話ごとに今までの ID を全部（古い順、`sessions`）と、いまの ID（`session`）を持ちます。ID は分かった時にすぐ書きます。古い形（`session` だけ）も読めます
 
 ## iPhone アプリから使う（serve）
 
