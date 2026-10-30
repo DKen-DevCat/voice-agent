@@ -702,11 +702,14 @@ done
     #[test]
     fn the_working_directory_stays_clear_of_what_is_guarded() {
         let home = crate::util::home_dir();
-        let guarded = [home.join("voice-agent"), home.join("lfm3-vl-server"), home.join(".config/voice-agent")];
+        let guarded = [home.join("voice-agent"), home.join("lfm3-vl-server"), home.join("WKEN-AGENTS"), home.join(".config/voice-agent")];
         assert!(check_workdir(&home.join("agent-work"), &guarded).is_ok());
         // found in the design review: start.sh moves into lfm3-vl-server,
         // where acceptEdits would let Claude edit without asking
         assert!(check_workdir(&home.join("lfm3-vl-server"), &guarded).is_err());
+        // lfm3-vl-server is being renamed WKEN-AGENTS (2026-10-31)
+        assert!(check_workdir(&home.join("WKEN-AGENTS"), &guarded).is_err());
+        assert!(check_workdir(&home.join("WKEN-AGENTS/server"), &guarded).is_err());
         assert!(check_workdir(&home.join("voice-agent/sub"), &guarded).is_err());
         assert!(check_workdir(&home, &guarded).is_err(), "home holds them all");
         assert!(check_workdir(Path::new("/"), &guarded).is_err());

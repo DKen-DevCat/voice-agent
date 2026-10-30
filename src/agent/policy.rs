@@ -431,7 +431,9 @@ mod tests {
 
     fn guarded(names: bool) -> Guarded {
         let home = home_dir();
-        Guarded::new(vec![home.join(".config/voice-agent"), home.join("voice-agent"), home.join("lfm3-vl-server")], names, home.join("agent-work"))
+        // lfm3-vl-server is being renamed WKEN-AGENTS (2026-10-31); both are
+        // kept until the move is done, then lfm3-vl-server can go
+        Guarded::new(vec![home.join(".config/voice-agent"), home.join("voice-agent"), home.join("lfm3-vl-server"), home.join("WKEN-AGENTS")], names, home.join("agent-work"))
     }
 
     #[test]
@@ -445,10 +447,15 @@ mod tests {
             ("Write", "file_path", format!("{home}/.config/voice-agent/devices.json")),
             ("Edit", "file_path", "~/.config/voice-agent/sessions.json".to_string()),
             ("MultiEdit", "file_path", format!("{home}/lfm3-vl-server/server/app.py")),
+            ("MultiEdit", "file_path", format!("{home}/WKEN-AGENTS/server/app.py")),
+            ("Edit", "file_path", format!("{home}/WKEN-AGENTS/docs/design.md")),
+            ("Edit", "file_path", "~/WKEN-AGENTS/docs/design.md".to_string()),
             ("NotebookEdit", "notebook_path", format!("{home}/voice-agent/x.ipynb")),
             // out of the working directory and back in
             ("Write", "file_path", "../voice-agent/src/app.rs".to_string()),
             ("Write", "file_path", format!("{home}/agent-work/../lfm3-vl-server/ios/LFM3/LFM3App.swift")),
+            ("Write", "file_path", format!("{home}/agent-work/../WKEN-AGENTS/ios/LFM3/LFM3App.swift")),
+            ("Write", "file_path", format!("{home}/WKEN-AGENTS/scripts/start.sh")),
         ] {
             assert!(guard(tool, &input(k, &v), &g, None).is_some(), "{tool} {v}");
         }
@@ -456,6 +463,7 @@ mod tests {
             ("Write", "file_path", format!("{home}/agent-work/notes.md")),
             ("Write", "file_path", "notes.md".to_string()),
             ("Write", "file_path", format!("{home}/voice-agent-notes/a.md")),
+            ("Write", "file_path", format!("{home}/WKEN-AGENTS-notes/a.md")),
             // reading is not writing
             ("Read", "file_path", format!("{home}/voice-agent/src/app.rs")),
         ] {
@@ -476,6 +484,8 @@ mod tests {
                 "rm ~/.config/voice-agent/sessions.json".to_string(),
                 "cp k.json \"$HOME/.config/voice-agent/devices.json\"".to_string(),
                 "echo x >> ${HOME}/lfm3-vl-server/scripts/start.sh".to_string(),
+                "echo x >> ${HOME}/WKEN-AGENTS/scripts/start.sh".to_string(),
+                "rm ~/WKEN-AGENTS/server/app.py".to_string(),
             ] {
                 assert!(guard(SHELL_RUN, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
                 assert!(guard(JOB_START, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
@@ -485,7 +495,7 @@ mod tests {
         }
         // under serve the folders' names are enough
         let serve = guarded(true);
-        for cmd in ["cd ~ && cd voice-agent && git pull", "cd .. && sed -i '' s/a/b/ lfm3-vl-server/server/app.py", "ls /x/voice-agent"] {
+        for cmd in ["cd ~ && cd voice-agent && git pull", "cd .. && sed -i '' s/a/b/ lfm3-vl-server/server/app.py", "ls /x/voice-agent", "cd .. && sed -i '' s/a/b/ WKEN-AGENTS/server/app.py", "ls /x/WKEN-AGENTS"] {
             assert!(guard(SHELL_RUN, &input("command", cmd), &serve, None).is_some(), "{cmd}");
             assert!(guard(SHELL_RUN, &input("command", cmd), &guarded(false), None).is_none(), "{cmd}");
         }
@@ -520,6 +530,10 @@ mod tests {
         };
         let inside = format!("{home}/lfm3-vl-server");
         assert!(guard(JOB_START, &job("echo x >> scripts/start.sh", &inside), &g, Some(&inside)).is_some());
+        let wken = format!("{home}/WKEN-AGENTS");
+        assert!(guard(JOB_START, &job("echo x >> scripts/start.sh", &wken), &g, Some(&wken)).is_some());
+        assert!(guard(SHELL_NEW, &input("dir", "~/WKEN-AGENTS"), &g, Some("~/WKEN-AGENTS")).is_some());
+        assert!(guard(SHELL_INPUT, &input("text", "ls\n"), &g, Some(&wken)).is_some());
         assert!(guard(SHELL_NEW, &input("dir", "~/voice-agent"), &g, Some("~/voice-agent")).is_some());
         assert!(guard(SHELL_RUN, &input("command", "sed -i '' s/Deny/Allow/ src/agent/policy.rs"), &g, Some(&format!("{home}/voice-agent/src"))).is_some());
         assert!(guard(SHELL_INPUT, &input("text", "ls\n"), &g, Some(&inside)).is_some());
