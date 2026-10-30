@@ -4,9 +4,10 @@
 //! would share the machine (or wait inside the engine, out of our sight), so
 //! whoever holds the engine makes everyone else wait. The engine goes to the
 //! waiting request of the highest priority: speech the user is waiting to
-//! hear, then a phrase for the cache, then a warm-up. A request that holds
-//! the engine is never preempted; that is why warm-ups are short (aivis.rs)
-//! and the cache is built only while nothing goes on (phrases.rs).
+//! hear, then the check that the engine is back, then a phrase for the
+//! cache, then a warm-up. A request that holds the engine is never
+//! preempted; that is why warm-ups are short (aivis.rs) and the cache is
+//! built only while nothing goes on (phrases.rs).
 //!
 //! Work nobody waits for also yields to the rest of an 8 GB M1, where whisper,
 //! AivisSpeech and Claude Code compete for memory and cores: no warm-up while
@@ -28,6 +29,10 @@ pub enum Use {
     Warm,
     /// Makes a phrase for the cache
     Cache,
+    /// Sees that the engine is back and warm, after which speech leaves `say`
+    /// for it: speech waits for it, so whisper or a subagent at work does not
+    /// keep it waiting
+    Ready,
     /// Speech the user is waiting to hear
     Speech,
 }
@@ -46,7 +51,7 @@ pub struct Activity {
 #[derive(Default)]
 struct State {
     held: Option<Use>,
-    waiting: [usize; 3], // by Use
+    waiting: [usize; 4], // by Use
 }
 
 pub struct Arbiter {
@@ -80,10 +85,11 @@ impl Arbiter {
         self.activity.get().map(|f| f()).unwrap_or_default()
     }
 
-    /// Whether work of this kind may start now. Speech always may.
+    /// Whether work of this kind may start now. Speech, and bringing the
+    /// engine back for it, always may.
     pub fn may(&self, u: Use) -> bool {
         match u {
-            Use::Speech => true,
+            Use::Speech | Use::Ready => true,
             Use::Warm => {
                 let a = self.now();
                 !a.transcribing && !a.agents
@@ -112,7 +118,8 @@ impl Arbiter {
     }
 
     /// Takes the engine once nobody holds it, nobody of a higher priority
-    /// waits for it and the work may run. A stopped request does not take it.
+    /// waits for it and the work may run. A stopped request does not take it,
+    /// nor does one whose time is up when the engine comes free.
     pub fn acquire(self: &Arc<Self>, u: Use, cancel: &Cancel, timeout: Duration) -> Result<Grant, SynthError> {
         let deadline = Instant::now() + timeout;
         let mut in_line = false;
@@ -131,11 +138,11 @@ impl Arbiter {
             let outranked = st.waiting[u as usize + 1..].iter().any(|&n| n > 0);
             let res = if cancel.is_cancelled() {
                 Some(Err(SynthError::Cancelled))
+            } else if Instant::now() >= deadline {
+                Some(Err(SynthError::Timeout))
             } else if may && st.held.is_none() && !outranked {
                 st.held = Some(u);
                 Some(Ok(()))
-            } else if Instant::now() >= deadline {
-                Some(Err(SynthError::Timeout))
             } else {
                 None
             };
@@ -219,7 +226,7 @@ mod tests {
         let cancel = Cancel::new();
         cancel.cancel();
         assert_eq!(arb.acquire(Use::Speech, &cancel, Duration::from_secs(1)).err(), Some(SynthError::Cancelled));
-        assert_eq!(arb.lock().waiting, [0, 0, 0]);
+        assert_eq!(arb.lock().waiting, [0, 0, 0, 0]);
         drop(held);
         assert_eq!(
             arb.acquire(Use::Speech, &cancel, Duration::from_secs(1)).err(),
@@ -271,7 +278,7 @@ mod tests {
         ] {
             *now.lock().unwrap() = a;
             assert_eq!((arb.may(Use::Warm), arb.may(Use::Cache)), (warm, cache), "{a:?}");
-            assert!(arb.may(Use::Speech));
+            assert!(arb.may(Use::Speech) && arb.may(Use::Ready));
         }
     }
 }

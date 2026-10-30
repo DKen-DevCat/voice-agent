@@ -40,6 +40,10 @@ const CHUNK_GROW: usize = 28;
 const CHUNK_MAX: usize = 64;
 /// How many chunks may be synthesized ahead of what is heard.
 const MAX_AHEAD: usize = 3;
+/// `say` and afplay do not tell when their sound begins, but one that fails
+/// (a voice not installed, a file it cannot read) ends well within this: one
+/// still playing by then is taken to have sounded from its start.
+const SOUNDING: Duration = Duration::from_millis(300);
 
 struct Patterns {
     rule_line: Regex,
@@ -762,10 +766,29 @@ impl Speaker {
         playing.push_back(false);
         let (s, c, cancel, tx) = (self.clone(), c.clone(), cancel.clone(), heard.clone());
         std::thread::spawn(move || {
-            // Told once it has played, as of its start: `say` and afplay do not
-            // tell when their sound begins, and one that failed never sounded
+            // Told as sounding from its start once it has played SOUNDING
+            // without failing, or has played to its end; one that failed never
+            // sounded. Whichever comes first tells
             let at = Instant::now();
+            let told = Arc::new(AtomicBool::new(false));
+            let tell = {
+                let (told, tx, cancel, note) = (told.clone(), tx.clone(), cancel.clone(), c.sounded(Some(at)));
+                move |sounded: bool| {
+                    if !cancel.is_cancelled()
+                        && !told.swap(true, Ordering::SeqCst)
+                        && let Some(mut s) = note.clone()
+                    {
+                        s.at = s.at.filter(|_| sounded);
+                        let _ = tx.send(Ev::Sounded(s));
+                    }
+                }
+            };
             let played = (c.wav.is_some() || !c.text.is_empty()) && {
+                let early = tell.clone();
+                std::thread::spawn(move || {
+                    std::thread::sleep(SOUNDING);
+                    early(true);
+                });
                 let res = match &s.play_fn {
                     Some(f) => f(&cancel, &c),
                     None => s.output(&cancel, &c),
@@ -777,11 +800,7 @@ impl Speaker {
                 }
                 res.is_ok()
             };
-            if !cancel.is_cancelled()
-                && let Some(told) = c.sounded(played.then_some(at))
-            {
-                let _ = tx.send(Ev::Sounded(told));
-            }
+            tell(played);
             let _ = tx.send(Ev::Heard);
         });
         true
@@ -1213,6 +1232,36 @@ mod tests {
         wait_silent(&s);
         let told: Vec<(u64, bool, bool)> = failing.lock().unwrap().iter().map(|t| (t.turn, t.say, t.at.is_some())).collect();
         assert_eq!(told, [(4, true, false)]);
+    }
+
+    /// `say` that has played a while has sounded, as of its start, even if
+    /// it is stopped before its end (the user talks over it).
+    #[test]
+    fn say_that_played_a_while_has_sounded() {
+        let told = Arc::new(Mutex::new(Vec::new()));
+        let t = told.clone();
+        let mut s = Speaker::new("Kyoko", 260, None, None, None, true, Box::new(|| {}));
+        s.play_fn = Some(Box::new(|cancel: &Cancel, _: &Clip| {
+            let until = Instant::now() + Duration::from_secs(3);
+            while !cancel.is_cancelled() && Instant::now() < until {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }));
+        s.tap = Some(Box::new(move |s| t.lock().unwrap().push(s.clone())));
+        let s = Arc::new(s);
+        let t0 = Instant::now();
+        s.speak_reply("長く話す返事です。", 5);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while told.lock().unwrap().is_empty() {
+            assert!(Instant::now() < deadline, "not told");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        s.stop();
+        let told = told.lock().unwrap();
+        assert_eq!((told.len(), told[0].turn), (1, 5));
+        let at = told[0].at.expect("it sounded");
+        assert!(at - t0 < SOUNDING, "as of its start: {:?}", at - t0);
     }
 
     #[test]

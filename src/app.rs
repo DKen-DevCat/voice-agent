@@ -705,17 +705,23 @@ impl Controller {
             self.latency.finish(turn, "error");
             return self.emit(Event::new(EventKind::Error, "Claude に接続できません。"));
         };
-        if claude.busy() {
+        // A reply whose end is still being handled counts as under way
+        let busy = claude.busy() || self.latency.answering();
+        if busy {
             // It goes in after the reply under way: the times would be that reply's
             self.latency.finish(turn, "busy");
         } else {
             // A reply silenced before is over; this one is heard
             self.lock().hushed = false;
-            self.latency.replying_to(turn);
         }
         let msg = format!("{text}\n\n<va_context>main shell cwd: {}</va_context>", self.cwd());
         match claude.send(&msg) {
-            Ok(()) => self.latency.mark(turn, Mark::Sent),
+            Ok(()) => {
+                if !busy {
+                    self.latency.replying_to(turn);
+                }
+                self.latency.mark(turn, Mark::Sent);
+            }
             Err(e) => {
                 self.latency.finish(turn, "error");
                 self.emit(Event::new(EventKind::Error, format!("Claude に送れません: {e}")));
@@ -1119,11 +1125,13 @@ fn chunker_for(speaker: &Arc<Speaker>, latency: &Arc<Latency>) -> SentenceChunke
     let (s1, s2, l) = (speaker.clone(), speaker.clone(), latency.clone());
     SentenceChunker::new(
         Box::new(move |s| {
-            let (turn, at) = (l.replying(), Instant::now());
-            // Only speech that was queued will sound (or be skipped) and end the turn
-            if s1.speak_reply(s, turn) {
-                l.mark_at(turn, Mark::FirstChunk, at);
+            let turn = l.replying();
+            // Only speech that is queued will sound (or be skipped) and end the
+            // turn; marked before, since it may sound at once
+            if s1.is_enabled() {
+                l.mark(turn, Mark::FirstChunk);
             }
+            s1.speak_reply(s, turn);
         }),
         Some(Box::new(move || s2.eager_first())),
     )
@@ -1543,6 +1551,16 @@ mod tests {
         c.handle_user_text("はい", "voice");
         assert_eq!(asked.join().unwrap()["behavior"], "allow");
         assert_eq!(ends()[5..], ["approval", "approval"], "the reply it came before, and the answer");
+        wait_for("claude is free", || !c.claude().unwrap().busy());
+
+        // Claude says it is free a moment before the end of its reply is
+        // handled: a message sent then does not take that end as its own
+        let ending = c.latency.begin("text", Instant::now());
+        c.latency.replying_to(ending);
+        c.handle_user_text("五つ目", "text");
+        c.latency.reply_ended(false);
+        assert_eq!(ends()[7..], ["busy", "silent"]);
+        wait_for("claude is free", || !c.claude().unwrap().busy());
 
         let open = c.latency.begin("voice", Instant::now());
         c.close();

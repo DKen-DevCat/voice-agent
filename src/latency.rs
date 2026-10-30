@@ -71,7 +71,8 @@ struct Turn {
 struct State {
     open: Vec<Turn>, // oldest first
     last: u64,       // the latest turn's id (ids start at 1)
-    replying: u64,   // the turn Claude's reply is for (0: none yet)
+    replying: u64,   // the turn last sent to Claude while it was free (0: none yet)
+    answering: bool, // Claude's reply to it has not ended yet
 }
 
 /// Turns are told apart by the id begin gives: what happens to one (a
@@ -131,6 +132,7 @@ impl Latency {
     pub fn replying_to(&self, turn: u64) {
         let mut st = self.lock();
         let before = std::mem::replace(&mut st.replying, turn);
+        st.answering = true;
         if before != turn
             && let Some(t) = st.take(before)
         {
@@ -138,9 +140,18 @@ impl Latency {
         }
     }
 
-    /// The turn Claude's reply is for (0: none).
+    /// Whether Claude's reply to the turn last sent has yet to end. Claude
+    /// says it is free a moment before its reply's end is handled; a message
+    /// sent in that moment would take the end of the reply before as its own.
+    pub fn answering(&self) -> bool {
+        self.lock().answering
+    }
+
+    /// The turn of the reply Claude is giving (0: none, or a turn Claude
+    /// started itself, such as relaying a subagent's result).
     pub fn replying(&self) -> u64 {
-        self.lock().replying
+        let st = self.lock();
+        if st.answering { st.replying } else { 0 }
     }
 
     /// Records that turn reached m now, unless it did before.
@@ -155,10 +166,10 @@ impl Latency {
         }
     }
 
-    /// mark for the turn Claude's reply is for.
+    /// mark for the turn of the reply Claude is giving.
     pub fn mark_reply(&self, m: Mark) {
         let mut st = self.lock();
-        let id = st.replying;
+        let id = if st.answering { st.replying } else { 0 };
         if let Some(t) = st.turn(id) {
             t.set(m, Instant::now());
         }
@@ -184,7 +195,8 @@ impl Latency {
         }
     }
 
-    /// finish for the turn Claude's reply is for.
+    /// finish for the turn last sent to Claude, while its reply is given or
+    /// spoken.
     pub fn finish_reply(&self, end: &str) {
         let mut st = self.lock();
         let id = st.replying;
@@ -201,11 +213,15 @@ impl Latency {
         }
     }
 
-    /// Claude's reply has ended (error: it failed). A reply that handed
-    /// nothing to speech ends its turn as silent; one that did waits for
-    /// that speech to sound or fail.
+    /// A reply of Claude's has ended (error: it failed). The reply to the
+    /// turn last sent ends that turn as silent if it handed nothing to
+    /// speech; one that did waits for that speech to sound or fail. The end
+    /// of a turn Claude started itself changes nothing.
     pub fn reply_ended(&self, error: bool) {
         let mut st = self.lock();
+        if !std::mem::take(&mut st.answering) {
+            return;
+        }
         let id = st.replying;
         let Some(t) = st.turn(id) else { return };
         if error || t.marks[Mark::FirstChunk as usize].is_none() {
@@ -441,6 +457,30 @@ mod tests {
         let got = lines(&path);
         assert_eq!(got.len(), 1);
         assert_eq!((got[0]["kind"].as_str(), got[0]["text"].as_str(), got[0]["ms"].as_u64()), (Some("phrase"), Some("はい、わかりました。"), Some(520)));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    /// What Claude says in a turn it started itself (relaying a subagent's
+    /// result) belongs to no turn of the user's, and its end ends none.
+    #[test]
+    fn turns_claude_starts_itself_count_for_nothing() {
+        let path = log_file("relay");
+        let l = Latency::new(Some(path.clone()));
+        let t = l.begin("text", Instant::now());
+        assert_eq!(l.replying(), 0);
+        l.replying_to(t);
+        assert!(l.answering());
+        assert_eq!(l.replying(), t);
+        l.mark_reply(Mark::FirstChunk);
+        l.reply_ended(false); // its speech is still to sound
+        assert!(!l.answering() && l.is_open(t));
+        assert_eq!(l.replying(), 0, "a relayed reply is told apart");
+        l.mark_reply(Mark::FirstText);
+        l.reply_ended(false);
+        assert!(l.is_open(t), "the relay's end did not end it");
+        assert!(l.lock().turn(t).unwrap().marks[Mark::FirstText as usize].is_none());
+        l.finish_reply("stopped"); // what is spoken of it can still be stopped
+        assert_eq!(ends(&path), [("text".into(), "stopped".into())]);
         let _ = std::fs::remove_file(&path);
     }
 
