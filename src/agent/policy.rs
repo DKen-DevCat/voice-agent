@@ -294,7 +294,7 @@ impl Guarded {
             paths
                 .iter()
                 .filter_map(|p| p.file_name())
-                .filter_map(|n| Regex::new(&format!(r#"(?:^|[\s/'"=:])\.?{}(?:$|[\s/'";&|)])"#, regex::escape(&n.to_string_lossy()))).ok())
+                .filter_map(|n| Regex::new(&format!(r#"(?i)(?:^|[\s/'"=:])\.?{}(?:$|[\s/'";&|)])"#, regex::escape(&n.to_string_lossy()))).ok())
                 .collect()
         } else {
             Vec::new()
@@ -326,7 +326,7 @@ pub fn guard(tool: &str, input: &Map<String, Value>, g: &Guarded, wd: Option<&st
 
 fn command_touches(cmd: &str, g: &Guarded) -> bool {
     static SUB: OnceLock<Regex> = OnceLock::new();
-    let sub = SUB.get_or_init(|| Regex::new(&format!(r"\bvoice-agent\b{REST}\b(?:pair|unpair|serve)\b")).unwrap());
+    let sub = SUB.get_or_init(|| Regex::new(&format!(r"(?i)\bvoice-agent\b{REST}\b(?:pair|unpair|serve)\b")).unwrap());
     if sub.is_match(cmd) {
         return true;
     }
@@ -343,7 +343,21 @@ fn mentions(cmd: &str, p: &Path, home: &Path) -> bool {
         let rest = rest.to_string_lossy();
         forms.extend([format!("~/{rest}"), format!("$HOME/{rest}"), format!("${{HOME}}/{rest}")]);
     }
-    forms.iter().any(|f| cmd.contains(f.as_str()))
+    // macOS volumes are case-insensitive by default: ~/wken-agents is
+    // ~/WKEN-AGENTS (the original text is kept for messages)
+    let cmd = cmd.to_lowercase();
+    forms.iter().any(|f| cmd.contains(f.to_lowercase().as_str()))
+}
+
+/// p with every component lowercased, for comparing only.
+fn fold(p: &Path) -> std::path::PathBuf {
+    p.components().map(|c| c.as_os_str().to_string_lossy().to_lowercase()).collect()
+}
+
+/// Whether `inner` is `outer` or below it, by whole components, ignoring
+/// case (the Mac's volume does). Both should be resolved already.
+pub fn is_inside(inner: &Path, outer: &Path) -> bool {
+    fold(inner).starts_with(fold(outer))
 }
 
 fn path_inside(target: &str, g: &Guarded) -> bool {
@@ -352,7 +366,7 @@ fn path_inside(target: &str, g: &Guarded) -> bool {
     }
     // an absolute target replaces the base
     let t = resolve(&g.base.join(crate::util::expand_home(target, &home_dir())));
-    g.paths.iter().any(|p| t.starts_with(resolve(p)))
+    g.paths.iter().any(|p| is_inside(&t, &resolve(p)))
 }
 
 /// Where p really is: links followed as far as the path exists, and `..`
@@ -500,6 +514,47 @@ mod tests {
             assert!(guard(SHELL_RUN, &input("command", cmd), &guarded(false), None).is_none(), "{cmd}");
         }
         assert!(guard(SHELL_RUN, &input("command", "echo voice-agents-are-fun"), &serve, None).is_none());
+    }
+
+    #[test]
+    fn the_guard_ignores_case_like_the_mac_volume_does() {
+        // found in the review (2026-10-31): ~/wken-agents is ~/WKEN-AGENTS on
+        // a case-insensitive APFS, so the spelling must not get past the guard
+        let home = home_dir().to_string_lossy().into_owned();
+        for names in [false, true] {
+            let g = guarded(names);
+            for p in [
+                "wken-agents/server/app.py", "Wken-Agents/server/app.py", "LFM3-VL-SERVER/server/app.py",
+                "Voice-Agent/src/app.rs", ".Config/voice-agent/devices.json", ".config/VOICE-AGENT/sessions.json",
+            ] {
+                for (tool, k) in [("Write", "file_path"), ("Edit", "file_path"), ("MultiEdit", "file_path"), ("NotebookEdit", "notebook_path")] {
+                    for v in [format!("{home}/{p}"), format!("~/{p}")] {
+                        assert!(guard(tool, &input(k, &v), &g, None).is_some(), "{tool} {v}");
+                    }
+                }
+                for cmd in [format!("echo x >> {home}/{p}"), format!("rm ~/{p}"), format!("cp k \"$HOME/{p}\""), format!("cat a > ${{HOME}}/{p}")] {
+                    assert!(guard(SHELL_RUN, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
+                    assert!(guard(JOB_START, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
+                }
+                // where a command runs
+                let dir = format!("{home}/{p}");
+                assert!(guard(SHELL_NEW, &input("dir", &dir), &g, Some(&dir)).is_some(), "{dir}");
+                assert!(guard(JOB_START, &input("command", "ls"), &g, Some(&dir)).is_some(), "{dir}");
+                assert!(guard(SHELL_INPUT, &input("text", "ls\n"), &g, Some(&dir)).is_some(), "{dir}");
+            }
+            // the boundary stays whole components
+            for p in ["wken-agents-notes/a.md", "Wken-Agents-notes/a.md", "voice-agents/a.md", "lfm3-vl-server2/a.md"] {
+                assert!(guard("Write", &input("file_path", &format!("{home}/{p}")), &g, None).is_none(), "{p}");
+                // (a command naming ~/voice-agent-x is refused as a prefix match: that
+                // was already so, and errs on the safe side)
+            }
+        }
+        // under serve a lowercase name alone is enough, a longer name is not
+        let serve = guarded(true);
+        for cmd in ["cd .. && sed -i '' s/a/b/ wken-agents/server/app.py", "ls /x/Voice-Agent", "ls LFM3-VL-SERVER", "Voice-Agent PAIR 1"] {
+            assert!(guard(SHELL_RUN, &input("command", cmd), &serve, None).is_some(), "{cmd}");
+        }
+        assert!(guard(SHELL_RUN, &input("command", "ls wken-agents-notes"), &serve, None).is_none());
     }
 
     #[test]

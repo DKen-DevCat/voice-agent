@@ -229,7 +229,7 @@ pub fn check_workdir(dir: &Path, guarded: &[PathBuf]) -> Result<(), String> {
     let d = resolve(dir);
     for p in guarded {
         let g = resolve(p);
-        if d.starts_with(&g) || g.starts_with(&d) {
+        if crate::agent::policy::is_inside(&d, &g) || crate::agent::policy::is_inside(&g, &d) {
             return Err(format!("作業フォルダ {} は、守る場所 {} の中か、それを含む所です（native-app.md §14.3）", dir.display(), p.display()));
         }
     }
@@ -710,6 +710,11 @@ done
         // lfm3-vl-server is being renamed WKEN-AGENTS (2026-10-31)
         assert!(check_workdir(&home.join("WKEN-AGENTS"), &guarded).is_err());
         assert!(check_workdir(&home.join("WKEN-AGENTS/server"), &guarded).is_err());
+        // case does not matter on the Mac's volume; the boundary stays whole components
+        for p in ["wken-agents", "Wken-Agents/server", "LFM3-VL-SERVER", "Voice-Agent/sub", ".Config/voice-agent"] {
+            assert!(check_workdir(&home.join(p), &guarded).is_err(), "{p}");
+        }
+        assert!(check_workdir(&home.join("wken-agents-notes"), &guarded).is_ok());
         assert!(check_workdir(&home.join("voice-agent/sub"), &guarded).is_err());
         assert!(check_workdir(&home, &guarded).is_err(), "home holds them all");
         assert!(check_workdir(Path::new("/"), &guarded).is_err());
