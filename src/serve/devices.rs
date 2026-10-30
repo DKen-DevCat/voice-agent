@@ -297,16 +297,9 @@ mod tests {
     use crate::serve::crypto::testing::TestKey;
 
     fn temp() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("va-devices-{}-{}", std::process::id(), unix_millis() % 1_000_000 + rand_u32() as i64));
+        let dir = std::env::temp_dir().join(format!("va-devices-{}", crate::serve::sessions::new_id()));
         std::fs::create_dir_all(&dir).unwrap();
         dir.join("devices.json")
-    }
-
-    fn rand_u32() -> u32 {
-        use std::io::Read;
-        let mut b = [0u8; 4];
-        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
-        u32::from_le_bytes(b)
     }
 
     #[test]

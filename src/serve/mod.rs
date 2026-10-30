@@ -141,6 +141,9 @@ impl Serve {
         let _moving = lock(&self.moving);
         let current = lock(&self.conv).clone();
         if current.as_deref() != Some(conv) {
+            // Found in the review: the map is written once a POLL, so a
+            // session learned just before moving would be lost
+            self.keep_session();
             let session = self.sessions.session(conv).unwrap_or_default();
             // The claude warmed at the start is on no conversation yet: a new
             // one can have it
@@ -205,6 +208,12 @@ impl Serve {
             self.hub.publish(json!({"kind": "jobs", "agents": counts.0, "jobs": counts.1}));
         }
         let _moving = lock(&self.moving);
+        self.keep_session();
+    }
+
+    /// Writes down the session claude is on for the conversation it is on
+    /// (with `moving` held).
+    fn keep_session(&self) {
         let session = self.ctl().session_id();
         if let Some(conv) = lock(&self.conv).clone()
             && !session.is_empty()
@@ -251,7 +260,7 @@ pub fn run(args: &[String]) -> i32 {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match (a.as_str(), it.next()) {
-            ("--dir", Some(d)) => dir = Some(d.strip_prefix("~/").map_or_else(|| PathBuf::from(d), |rest| home.join(rest))),
+            ("--dir", Some(d)) => dir = Some(crate::util::expand_home(d, &home)),
             ("--port", Some(p)) if p.parse::<u16>().is_ok() => port = p.parse().unwrap_or(PORT),
             _ => {
                 eprintln!("usage: voice-agent serve --dir <working directory> [--port <port>]");
@@ -266,6 +275,8 @@ pub fn run(args: &[String]) -> i32 {
         );
         return 2;
     };
+    // A relative --dir that is not there yet would be checked as nothing
+    let dir = if dir.is_absolute() { dir } else { std::env::current_dir().unwrap_or_default().join(dir) };
     let key = std::env::var("VA_SERVE_KEY").unwrap_or_default();
     if key.len() < 16 {
         eprintln!("voice-agent: serve needs VA_SERVE_KEY (lfm3-vl-server's start.sh makes one)");
@@ -284,7 +295,10 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("voice-agent: {e}");
         return 2;
     }
-    if let Err(e) = std::fs::create_dir_all(&dir).and(crate::util::private_dir(&rt)) {
+    // The process works there too: a relative dir given to a job or a shell
+    // starts from it, as the guard reads it (start.sh runs this from inside
+    // lfm3-vl-server)
+    if let Err(e) = std::fs::create_dir_all(&dir).and(crate::util::private_dir(&rt)).and_then(|_| std::env::set_current_dir(&dir)) {
         eprintln!("voice-agent: {e}");
         return 1;
     }
@@ -316,7 +330,8 @@ pub fn run(args: &[String]) -> i32 {
         eprintln!("voice-agent: {e}");
         return 1;
     }
-    if let Err(e) = control::listen(&sock, devices) {
+    let s = serve.clone();
+    if let Err(e) = control::listen(&sock, devices, Arc::new(move || s.hub.close_client())) {
         eprintln!("voice-agent: {}: {e}", sock.display());
         ctl.close();
         return 1;
@@ -362,10 +377,21 @@ pub fn pair(code: &str) -> i32 {
 /// `voice-agent unpair`: forgets the paired iPhone (when it is lost). Through
 /// the running serve, or in the file when none runs.
 pub fn unpair() -> i32 {
-    let reply = control::send(&crate::log::runtime_dir().join("control.sock"), "unpair").map(|r| r.trim().to_string());
+    let rt = crate::log::runtime_dir();
+    let reply = control::send(&rt.join("control.sock"), "unpair").map(|r| r.trim().to_string());
     let done = match reply {
         Ok(r) => r == "ok",
         Err(_) => {
+            // No serve to tell: the file is changed, with the lock held so
+            // that none starts meanwhile. Found in the review: a serve the
+            // socket does not reach would go on trusting the keys it holds
+            let _ = crate::util::private_dir(&rt);
+            let Ok(_lock) = crate::lock(&rt) else {
+                eprintln!(
+                    "voice-agent（serve かターミナル）が動いていますが、control.sock に届きません。止めてから（serve は lfm3-vl-server の stop.sh）もう一度打ってください"
+                );
+                return 1;
+            };
             let cfg = Config::load(&crate::util::home_dir());
             let conf = cfg.file.parent().map(Path::to_path_buf).unwrap_or_default();
             Devices::load(&conf.join("devices.json")).unpair("mac").is_ok()
@@ -529,7 +555,7 @@ done
         .to_string();
         assert_eq!(call(h, None, "POST", "/agent/pair", &body, "").0, 202);
         // what `voice-agent pair 123456` sends
-        assert!(control::reply("pair 123456", &h.serve.devices).starts_with("ok "));
+        assert!(control::reply("pair 123456", &h.serve.devices, &|| {}).starts_with("ok "));
     }
 
     #[test]
@@ -624,6 +650,44 @@ done
             std::thread::sleep(Duration::from_millis(10));
         }
         panic!("claude was not started on the first conversation's session");
+    }
+
+    #[test]
+    fn a_session_learned_just_before_moving_is_kept() {
+        let h = harness();
+        pair(&h);
+        let new_conv = || call(&h, Some(&h.device), "POST", "/agent/sessions", "{}", "runA").1["id"].as_str().unwrap().to_string();
+        let (a, b) = (new_conv(), new_conv());
+        let body = json!({"text": "やあ", "via": "text"}).to_string();
+        assert_eq!(call(&h, Some(&h.device), "POST", &format!("/agent/sessions/{a}/messages"), &body, "runA").0, 200);
+        // claude has its session; the once-a-second look (poll) has not come
+        for _ in 0..500 {
+            if !h.ctl.session_id().is_empty() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let sa = h.ctl.session_id();
+        assert!(!sa.is_empty());
+        assert_eq!(h.serve.sessions.session(&a), None);
+        assert_eq!(call(&h, Some(&h.device), "POST", &format!("/agent/sessions/{b}/messages"), &body, "runA").0, 200);
+        assert_eq!(h.serve.sessions.session(&a).as_deref(), Some(sa.as_str()));
+        h.ctl.close();
+    }
+
+    #[test]
+    fn unpairing_closes_the_open_stream() {
+        // found in the review: a lost iPhone kept its stream after unpairing
+        let h = harness();
+        pair(&h);
+        let (_, state) = call(&h, Some(&h.device), "GET", "/agent/state", "", "");
+        let mut events = open_events(&h, &format!("runA:{}", state["seq"]));
+        assert!(control::reply("unpair", &h.serve.devices, &|| h.serve.hub.close_client()).starts_with("ok"));
+        let mut rest = String::new();
+        use std::io::Read;
+        let _ = events.read_to_string(&mut rest);
+        assert!(!rest.contains("data:"), "{rest}");
+        h.ctl.close();
     }
 
     #[test]

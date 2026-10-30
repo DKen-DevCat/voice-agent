@@ -121,7 +121,10 @@ impl ClaudeSession {
                         Ok(_) => {}
                     }
                     let l = line.trim_ascii();
-                    if !l.is_empty() {
+                    // Found in the review: what a launch left behind for
+                    // another conversation still had in the pipe would land
+                    // on the new one (its text, its session id): read past it
+                    if !l.is_empty() && generation > s.lock().retired {
                         s.on_message(l, &mut blocks);
                     }
                 }
@@ -393,6 +396,37 @@ done
             assert!(std::time::Instant::now() < deadline, "{what}");
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    #[test]
+    fn what_a_launch_left_behind_still_says_is_not_heard() {
+        // found in the review: the old process's lines still in the pipe set
+        // the new conversation's session id and spoke in it
+        let dir = std::env::temp_dir().join(format!("va-claude-retired-{}-{}", std::process::id(), crate::util::unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let bin = dir.join("claude");
+        let script = r#"#!/bin/sh
+trap '' TERM
+while IFS= read -r line; do
+  printf '%s\n' '{"type":"system","subtype":"init","session_id":"old","model":"fake"}'
+  sleep 0.5
+  printf '%s\n' '{"type":"stream_event","event":{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"left behind"}}}'
+  printf '%s\n' '{"type":"result","subtype":"success","is_error":false,"result":"x","session_id":"old"}'
+done
+"#;
+        std::fs::write(&bin, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (s, seen) = session_at(bin);
+        s.send("one").unwrap();
+        wait_until("the old session is ready", || s.session_id() == "old");
+        s.switch_to("s9");
+        // it ignores the signal and talks on for a while
+        std::thread::sleep(Duration::from_millis(900));
+        assert_eq!(s.session_id(), "s9");
+        let seen = seen.lock().unwrap();
+        assert!(!seen.iter().any(|l| l.contains("left behind")), "{seen:?}");
+        assert!(!seen.iter().any(|l| l.starts_with("turn_end")), "{seen:?}");
     }
 
     #[test]

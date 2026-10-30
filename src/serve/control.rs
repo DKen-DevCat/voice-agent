@@ -13,30 +13,31 @@ use std::time::Duration;
 use super::devices::{ConfirmError, Devices};
 use crate::log::log;
 
-pub fn listen(path: &Path, devices: Arc<Devices>) -> std::io::Result<()> {
+/// on_unpair: what else forgets the iPhone (its open stream).
+pub fn listen(path: &Path, devices: Arc<Devices>, on_unpair: Arc<dyn Fn() + Send + Sync>) -> std::io::Result<()> {
     let _ = std::fs::remove_file(path);
     let listener = UnixListener::bind(path)?;
     use std::os::unix::fs::PermissionsExt;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     std::thread::spawn(move || {
         for conn in listener.incoming().flatten() {
-            let devices = devices.clone();
-            std::thread::spawn(move || answer(conn, &devices));
+            let (devices, on_unpair) = (devices.clone(), on_unpair.clone());
+            std::thread::spawn(move || answer(conn, &devices, &*on_unpair));
         }
     });
     Ok(())
 }
 
-fn answer(mut conn: UnixStream, devices: &Devices) {
+fn answer(mut conn: UnixStream, devices: &Devices, on_unpair: &dyn Fn()) {
     let _ = conn.set_read_timeout(Some(Duration::from_secs(5)));
     let mut line = String::new();
     let _ = BufReader::new((&conn).take(256)).read_line(&mut line);
-    let reply = reply(line.trim(), devices);
+    let reply = reply(line.trim(), devices, on_unpair);
     let _ = conn.write_all(reply.as_bytes());
 }
 
 /// One command, one line back: "ok ...", or what went wrong.
-pub fn reply(line: &str, devices: &Devices) -> String {
+pub fn reply(line: &str, devices: &Devices, on_unpair: &dyn Fn()) -> String {
     let (cmd, arg) = line.split_once(' ').unwrap_or((line, ""));
     match cmd {
         "pair" => match devices.confirm(arg) {
@@ -55,6 +56,7 @@ pub fn reply(line: &str, devices: &Devices) -> String {
         },
         "unpair" => match devices.unpair("mac") {
             Ok(()) => {
+                on_unpair();
                 log("serve: unpaired from the Mac");
                 "ok".into()
             }
@@ -110,7 +112,9 @@ mod tests {
         let dir = temp();
         let devices = Arc::new(Devices::load(&dir.join("devices.json")));
         let sock = dir.join("control.sock");
-        listen(&sock, devices.clone()).unwrap();
+        let unpaired = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let u = unpaired.clone();
+        listen(&sock, devices.clone(), Arc::new(move || u.store(true, std::sync::atomic::Ordering::SeqCst))).unwrap();
         use std::os::unix::fs::PermissionsExt;
         assert_eq!(std::fs::metadata(&sock).unwrap().permissions().mode() & 0o777, 0o600);
 
@@ -124,6 +128,7 @@ mod tests {
         assert!(devices.paired());
         assert_eq!(send(&sock, "unpair").unwrap(), "ok");
         assert!(!devices.paired());
+        assert!(unpaired.load(std::sync::atomic::Ordering::SeqCst), "the stream is let go too");
         assert_eq!(send(&sock, "rm -rf /").unwrap(), "error unknown command");
     }
 

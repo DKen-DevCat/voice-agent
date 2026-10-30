@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 
 use super::mcp::{Handler, Tool, ToolResult};
-use super::policy::{JOB_START, SHELL_INPUT, SHELL_RUN};
+use super::policy::{JOB_START, SHELL_INPUT, SHELL_NEW, SHELL_RUN};
 use crate::shell::bridge::RunResult;
 use crate::shell::jobs::{JobInfo, Jobs};
 use crate::shell::registry::{MAIN, Registry, Shell};
@@ -261,6 +261,10 @@ fn shell_list(h: &dyn ToolHost, _: &Map<String, Value>) -> ToolResult {
 
 fn shell_new(h: &dyn ToolHost, args: &Map<String, Value>) -> ToolResult {
     let name = str_arg(args, "name").trim();
+    // Where it starts is checked too (voice-agent guards some folders)
+    if let Err(refusal) = h.permit(SHELL_NEW, args) {
+        return ToolResult::error(refusal);
+    }
     let dir = str_arg(args, "dir").trim();
     let dir = (!dir.is_empty()).then(|| PathBuf::from(dir));
     match h.shells().start(name, dir) {

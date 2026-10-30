@@ -94,10 +94,7 @@ impl Config {
 
     /// file: where raw was read from
     fn from_raw(r: Raw, home: &Path, cwd: &Path, file: &Path) -> Config {
-        let expand = |s: &str| match s.strip_prefix("~/") {
-            Some(rest) => home.join(rest),
-            None => PathBuf::from(s),
-        };
+        let expand = |s: &str| crate::util::expand_home(s, home);
         Config {
             // The shells must be zsh for the OSC 633 integration
             shell: or(r.shell, "/bin/zsh"),

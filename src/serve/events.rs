@@ -82,6 +82,12 @@ impl Hub {
         seq
     }
 
+    /// Lets the client go (its stream ends): after unpairing, its keys are
+    /// no longer trusted.
+    pub fn close_client(&self) {
+        self.lock().client = None;
+    }
+
     /// A client (re)connects with the last event it has, if any. Without one
     /// it gets only what comes (it read GET /agent/state first). Taken under
     /// the lock, so that nothing falls between the backlog and the stream.

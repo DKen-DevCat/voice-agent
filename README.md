@@ -124,7 +124,8 @@ voice-agent unpair        # 対を解く（iPhone を失くした時など。ふ
 - 届く要求は、どれも対にした iPhone の鍵で署名されたものだけを受け付けます。許可は、iPhone の承認の鍵（Face ID かパスコード）で署名したものだけです。文字の「はい」では許可にせず、iPhone に Face ID での確かめを求めます
 - 承認の待ちは 10 分です（ターミナルは 180 秒）
 - `--dir` の作業フォルダは必須です。設定の `protect` のフォルダ（既定は voice-agent と lfm3-vl-server）、設定の場所、実行時の場所の中にも、それらを含む所にも置けません。Claude Code は作業フォルダの中を承認なしで編集するためです
-- エージェントは、`protect` のフォルダと voice-agent の設定・`control.sock` に書き込めず、`voice-agent pair`・`unpair`・`serve` も動かせません（確認ではなく固定で断ります。ターミナルでも、設定の場所と `control.sock` と、この 3 つのコマンドは断ります）
+- エージェントは、`protect` のフォルダと voice-agent の設定の場所・`control.sock` に書き込めず、`voice-agent pair`・`unpair`・`serve` も動かせません（確認ではなく固定で断ります）。そこで動くコマンドも断ります（`job_start`・`shell_new` の `dir`、そこへ移ったシェル）。ターミナルでも、`devices.json`・`sessions.json`・`control.sock` と、この 3 つのコマンドは断ります（設定と `persona.md` は今までどおり読み書きできます）
+- Claude Code は `--setting-sources user` で起動し、`~/.claude/settings.json` だけを読みます。作業フォルダの中はエージェントが承認なしで書けるので、そこに置かれた `.claude/settings*.json`（許可のルールやフック）は効きません。`~/.claude` への書き込みも固定で断ります
 - 別の会話に送ると、Claude Code をその会話のセッションの続き（`--resume`）で開き直します。ジョブは止めません
 
 ## 返答の速さ

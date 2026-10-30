@@ -242,13 +242,21 @@ impl Controller {
     /// AivisSpeech engine, no player, no `say`) and approvals wait longer.
     pub fn new_with(cfg: Config, hooks: Hooks, runtime_dir: PathBuf, deliver: Deliver, front: Front) -> Arc<Controller> {
         let serve = front == Front::Serve;
-        // What the agent may not write: voice-agent's own keys and settings,
-        // and under serve the folders approvals rest on
-        let mut paths = vec![cfg.file.parent().map(|d| d.to_path_buf()).unwrap_or_default(), runtime_dir.join("control.sock")];
+        // What the agent may not write: the paired keys, the sessions and the
+        // control socket; under serve all of voice-agent's settings and the
+        // folders approvals rest on (the terminal's agent may still read and
+        // edit its config and persona, as before)
+        let conf = cfg.file.parent().map(|d| d.to_path_buf()).unwrap_or_default();
+        let mut paths = vec![runtime_dir.join("control.sock")];
         if serve {
+            paths.push(conf);
+            // Claude Code's own settings (its permissions and hooks)
+            paths.push(crate::util::home_dir().join(".claude"));
             paths.extend(cfg.protect.iter().cloned());
+        } else if !conf.as_os_str().is_empty() {
+            paths.extend([conf.join("devices.json"), conf.join("sessions.json")]);
         }
-        let guarded = Guarded { paths: paths.into_iter().filter(|p| !p.as_os_str().is_empty()).collect(), names: serve, base: cfg.dir.clone() };
+        let guarded = Guarded::new(paths, serve, cfg.dir.clone());
         Arc::new_cyclic(|weak: &Weak<Controller>| {
             let w = weak.clone();
             let describe = Box::new(move |name: &str, input: &Map<String, Value>| w.upgrade().map(|c| c.describe_tool(name, input)).unwrap_or_default());
@@ -546,6 +554,13 @@ impl Controller {
         .collect();
         if !self.cfg.model.is_empty() {
             args.extend(["--model".to_string(), self.cfg.model.clone()]);
+        }
+        // Under serve the agent edits its working directory without asking:
+        // a .claude/settings there could allow what the guard refuses, or run
+        // commands from hooks past every approval. Only the user's settings
+        // count (found in the security review; ~/.claude is guarded)
+        if self.front == Front::Serve {
+            args.extend(["--setting-sources".to_string(), "user".to_string()]);
         }
         if !self.cfg.effort.is_empty() {
             args.extend(["--effort".to_string(), self.cfg.effort.clone()]);
@@ -1099,7 +1114,7 @@ impl Controller {
     /// so that the tool itself does not ask again when it runs (!prompt).
     fn check(&self, tool: &str, input: &Map<String, Value>, from_tool: bool) -> Result<(), String> {
         // What voice-agent guards is refused before anything else, never asked
-        if let Some(reason) = guard(tool, input, &self.guarded) {
+        if let Some(reason) = guard(tool, input, &self.guarded, self.runs_in(tool, input).as_deref()) {
             self.emit(Event::tool("blocked", self.summary(tool, input)));
             return Err(reason);
         }
@@ -1131,10 +1146,26 @@ impl Controller {
         Ok(())
     }
 
+    /// Where a shell tool's command would run: the shell's directory, or the
+    /// dir it is given (job_start: else where the main shell is).
+    fn runs_in(&self, tool: &str, input: &Map<String, Value>) -> Option<String> {
+        let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default().trim().to_string();
+        let cwd_of = |name: &str| self.shells.get(if name.is_empty() { MAIN } else { name }).map(|sh| sh.status().cwd).filter(|c| !c.is_empty());
+        let given = Some(s("dir")).filter(|d| !d.is_empty());
+        match tool {
+            SHELL_RUN | SHELL_INPUT => cwd_of(&s("shell")),
+            JOB_START => given.or_else(|| cwd_of(MAIN)),
+            SHELL_NEW => given,
+            _ => None,
+        }
+    }
+
     /// What a call does, as the approval shows it.
     fn summary(&self, tool: &str, input: &Map<String, Value>) -> String {
         let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
         match tool {
+            // Where a job runs shows too, when it is given
+            JOB_START if !s("dir").trim().is_empty() => format!("{}（{}）", with_shell(s("shell"), s("command")), self.short(s("dir").trim())),
             SHELL_RUN | JOB_START => with_shell(s("shell"), s("command")),
             SHELL_INPUT => with_shell(s("shell"), &format!("入力 {:?}", s("text"))),
             _ => {
@@ -1412,6 +1443,37 @@ mod tests {
     }
 
     #[test]
+    fn under_serve_claude_reads_only_the_users_settings() {
+        // found in the security review: the agent edits its working
+        // directory without asking, and a .claude/settings there could allow
+        // what the guard refuses or run hooks past every approval
+        let (serve, _, _home) = serve_controller();
+        let argv = serve.claude_args(Path::new("/x/mcp.json"));
+        let i = argv.iter().position(|a| a == "--setting-sources").expect("--setting-sources");
+        assert_eq!(argv[i + 1], "user");
+        let (terminal, _) = controller();
+        assert!(!terminal.claude_args(Path::new("/x/mcp.json")).iter().any(|a| a == "--setting-sources"), "the terminal reads them all, as before");
+        // and the user's own settings are guarded under serve
+        let settings = crate::util::home_dir().join(".claude/settings.json");
+        assert_eq!(serve.approve(&args(json!({"tool_name": "Write", "input": {"file_path": settings}})))["behavior"], "deny");
+    }
+
+    #[test]
+    fn a_job_shows_where_it_runs() {
+        let (c, events, home) = serve_controller();
+        let c2 = c.clone();
+        let dir = home.join("work/app");
+        let d = dir.clone();
+        let asked = std::thread::spawn(move || c2.approve(&args(json!({"tool_name": JOB_START, "input": {"command": "git push origin main", "dir": d}}))));
+        wait_status(&c, "CONFIRM");
+        let approval = kinds(&events, EventKind::Approval).remove(0);
+        assert!(approval.text.starts_with("git push origin main（"), "{}", approval.text);
+        assert!(approval.text.contains("app"), "{}", approval.text);
+        c.answer_by_id("ap1", false, "button", "k").unwrap();
+        assert_eq!(asked.join().unwrap()["behavior"], "deny");
+    }
+
+    #[test]
     fn claude_waits_for_an_approval_as_long_as_it_can_take() {
         let get = |env: &[(OsString, OsString)], k: &str| env.iter().find(|(n, _)| n == k).map(|(_, v)| v.to_string_lossy().into_owned());
         let (serve, _, _) = serve_controller();
@@ -1501,11 +1563,22 @@ mod tests {
         }
         let v = c.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "voice-agent pair 123456"}})));
         assert_eq!(v["behavior"], "deny");
+        // where a job or a new shell would run counts too (found in the review)
+        let v = c.approve(&args(json!({"tool_name": JOB_START, "input": {"command": "echo x >> start.sh", "dir": home.join("trust")}})));
+        assert_eq!(v["behavior"], "deny");
+        let v = c.approve(&args(json!({"tool_name": SHELL_NEW, "input": {"name": "w", "dir": home.join("trust/ios")}})));
+        assert_eq!(v["behavior"], "deny");
         assert_eq!(c.status_now(), "STANDBY", "nothing was asked");
-        assert_eq!(kinds(&events, EventKind::Tool).iter().filter(|e| e.tag == "blocked").count(), 4);
-        // the terminal guards voice-agent's own files, not the trust base
+        assert_eq!(kinds(&events, EventKind::Tool).iter().filter(|e| e.tag == "blocked").count(), 6);
+        // the terminal guards the keys, the sessions and the socket, not the
+        // trust base, and its agent may still read its config and persona
         let (t, _) = controller();
         let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": "./target/release/voice-agent unpair"}})));
+        assert_eq!(v["behavior"], "deny");
+        let conf = t.cfg.file.parent().unwrap().to_path_buf();
+        let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": format!("cat {}", conf.join("persona.md").display())}})));
+        assert_eq!(v["behavior"], "allow");
+        let v = t.approve(&args(json!({"tool_name": SHELL_RUN, "input": {"command": format!("cat x > {}", conf.join("devices.json").display())}})));
         assert_eq!(v["behavior"], "deny");
     }
 

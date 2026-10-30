@@ -102,7 +102,8 @@ impl Verifier {
             return Err(Refusal::WrongKey);
         }
         let time: i64 = req.time.parse().map_err(|_| Refusal::Stale)?;
-        if (now_ms - time).abs() > WINDOW_MS {
+        // abs_diff: a time near the ends of i64 cannot wrap into the window
+        if now_ms.abs_diff(time) > WINDOW_MS as u64 {
             return Err(Refusal::Stale);
         }
         let signature = unbase64(req.signature).ok_or(Refusal::BadSignature)?;
@@ -143,18 +144,11 @@ pub mod testing {
     }
 
     pub fn sign(key: &TestKey, method: &str, path: &str, run: &str, body: &[u8], time_ms: i64) -> Headers {
-        let nonce: String = (0..32).map(|_| format!("{:x}", rand_nibble())).collect();
+        let nonce = hex(&crate::util::random_bytes::<16>());
         let time = time_ms.to_string();
         let run_signed = if method == "POST" { run } else { "" };
         let text = string_to_sign(method, path, &time, &nonce, run_signed, body);
         Headers { key: key.id(), time, nonce, run: run.to_string(), signature: base64(&key.sign(text.as_bytes())) }
-    }
-
-    fn rand_nibble() -> u8 {
-        use std::io::Read;
-        let mut b = [0u8; 1];
-        let _ = std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut b));
-        b[0] & 15
     }
 }
 
@@ -225,6 +219,17 @@ mod tests {
         assert_eq!(check(&v, &p, "GET", "/agent/state", &late, b"", d), Err(Refusal::Stale));
         let early = sign(&p.device, "GET", "/agent/state", "", b"", NOW + WINDOW_MS + 1);
         assert_eq!(check(&v, &p, "GET", "/agent/state", &early, b"", d), Err(Refusal::Stale));
+    }
+
+    #[test]
+    fn times_at_the_ends_of_the_range_are_stale_not_a_panic() {
+        // found in the review: (now - time).abs() overflowed (a panic in a
+        // debug build; in release it could wrap into the window)
+        let (v, p) = (Verifier::default(), Pair::new());
+        for t in [i64::MIN, i64::MAX, i64::MIN + 1] {
+            let h = Headers { time: t.to_string(), ..sign(&p.device, "GET", "/agent/state", "", b"", NOW) };
+            assert_eq!(check(&v, &p, "GET", "/agent/state", &h, b"", &[Role::Device]), Err(Refusal::Stale), "{t}");
+        }
     }
 
     #[test]

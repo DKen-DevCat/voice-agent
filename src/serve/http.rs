@@ -66,16 +66,12 @@ fn header<'a>(req: &'a Request, name: &'static str) -> &'a str {
     req.headers().iter().find(|h| h.field.equiv(name)).map(|h| h.value.as_str()).unwrap_or_default()
 }
 
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
-}
-
 fn handle(s: &Serve, mut req: Request) {
     let method = req.method().to_string();
     let url = req.url().to_string();
     let path = url.split('?').next().unwrap_or_default().to_string();
     let bearer = header(&req, "Authorization").strip_prefix("Bearer ").unwrap_or_default();
-    if !constant_time_eq(bearer.as_bytes(), s.key.as_bytes()) {
+    if !crate::util::constant_time_eq(bearer.as_bytes(), s.key.as_bytes()) {
         return respond(req, error(401, "unauthorized"));
     }
     let mut body = Vec::new();
@@ -118,7 +114,10 @@ fn handle(s: &Serve, mut req: Request) {
         Route::State => (200, s.state()),
         Route::Devices => (200, s.devices.view()),
         Route::Unpair => match s.devices.unpair("iphone") {
-            Ok(()) => (204, Value::Null),
+            Ok(()) => {
+                s.hub.close_client();
+                (204, Value::Null)
+            }
             Err(_) => error(500, "write_failed"),
         },
         Route::NewSession => (200, json!({"id": s.sessions.create()})),

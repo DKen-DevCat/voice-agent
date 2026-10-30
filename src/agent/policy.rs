@@ -278,11 +278,29 @@ pub fn decide(tool: &str, input: &Map<String, Value>, deny: &[DenyRule]) -> Deci
 /// this narrows the way, and the iPhone notices what gets through.
 #[derive(Clone, Debug, Default)]
 pub struct Guarded {
-    pub paths: Vec<std::path::PathBuf>,
-    /// Under serve: a command naming a guarded folder is refused too
-    pub names: bool,
+    paths: Vec<std::path::PathBuf>,
+    /// Under serve, a command naming a guarded folder is refused too: the
+    /// patterns for those names, made once
+    names: Vec<Regex>,
     /// Where relative paths start (Claude's working directory)
-    pub base: std::path::PathBuf,
+    base: std::path::PathBuf,
+}
+
+impl Guarded {
+    /// paths: what is guarded; names: whether a command naming one by its
+    /// last part is refused (serve); base: where relative paths start.
+    pub fn new(paths: Vec<std::path::PathBuf>, names: bool, base: std::path::PathBuf) -> Guarded {
+        let names = if names {
+            paths
+                .iter()
+                .filter_map(|p| p.file_name())
+                .filter_map(|n| Regex::new(&format!(r#"(?:^|[\s/'"=:])\.?{}(?:$|[\s/'";&|)])"#, regex::escape(&n.to_string_lossy()))).ok())
+                .collect()
+        } else {
+            Vec::new()
+        };
+        Guarded { paths: paths.into_iter().filter(|p| !p.as_os_str().is_empty()).collect(), names, base }
+    }
 }
 
 pub const GUARD_REASON: &str = "voice-agent guards this (the paired iPhone's keys, its settings, and the folders approvals rest on): it is refused outright. Do not try to work around it; tell the user they can do it themselves at the Mac.";
@@ -290,11 +308,16 @@ pub const GUARD_REASON: &str = "voice-agent guards this (the paired iPhone's key
 /// Claude Code's own tools that write files.
 const WRITE_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
 
-pub fn guard(tool: &str, input: &Map<String, Value>, g: &Guarded) -> Option<String> {
+/// wd: where a shell tool's command would run (the shell's directory, or the
+/// dir it is given). Found in the review: a command that names nothing
+/// guarded can still write there when it runs in a guarded folder.
+pub fn guard(tool: &str, input: &Map<String, Value>, g: &Guarded, wd: Option<&str>) -> Option<String> {
     let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
+    let runs_inside = || wd.is_some_and(|w| path_inside(w, g));
     let hit = match tool {
-        SHELL_RUN | JOB_START => command_touches(s("command"), g),
-        SHELL_INPUT => command_touches(s("text"), g),
+        SHELL_RUN | JOB_START => command_touches(s("command"), g) || runs_inside(),
+        SHELL_INPUT => command_touches(s("text"), g) || runs_inside(),
+        SHELL_NEW => runs_inside(),
         _ if WRITE_TOOLS.contains(&tool) => ["file_path", "notebook_path", "path"].iter().any(|k| path_inside(s(k), g)),
         _ => false,
     };
@@ -308,11 +331,11 @@ fn command_touches(cmd: &str, g: &Guarded) -> bool {
         return true;
     }
     let home = home_dir();
-    g.paths.iter().any(|p| mentions(cmd, p, &home, g.names))
+    g.paths.iter().any(|p| mentions(cmd, p, &home)) || g.names.iter().any(|re| re.is_match(cmd))
 }
 
-/// Whether cmd names p: in full, from ~ or $HOME, or (names) by its last part.
-fn mentions(cmd: &str, p: &Path, home: &Path, names: bool) -> bool {
+/// Whether cmd names p in full, or from ~ or $HOME.
+fn mentions(cmd: &str, p: &Path, home: &Path) -> bool {
     let mut forms = vec![p.to_string_lossy().into_owned()];
     if let Ok(rest) = p.strip_prefix(home)
         && !home.as_os_str().is_empty()
@@ -320,55 +343,43 @@ fn mentions(cmd: &str, p: &Path, home: &Path, names: bool) -> bool {
         let rest = rest.to_string_lossy();
         forms.extend([format!("~/{rest}"), format!("$HOME/{rest}"), format!("${{HOME}}/{rest}")]);
     }
-    if forms.iter().any(|f| cmd.contains(f.as_str())) {
-        return true;
-    }
-    names
-        && p.file_name().is_some_and(|n| {
-            let n = regex::escape(&n.to_string_lossy());
-            Regex::new(&format!(r#"(?:^|[\s/'"=:])\.?{n}(?:$|[\s/'";&|)])"#)).is_ok_and(|re| re.is_match(cmd))
-        })
+    forms.iter().any(|f| cmd.contains(f.as_str()))
 }
 
 fn path_inside(target: &str, g: &Guarded) -> bool {
     if target.is_empty() {
         return false;
     }
-    let target = match target.strip_prefix("~/") {
-        Some(rest) => home_dir().join(rest),
-        None => g.base.join(target), // an absolute target replaces the base
-    };
-    let t = resolve(&target);
+    // an absolute target replaces the base
+    let t = resolve(&g.base.join(crate::util::expand_home(target, &home_dir())));
     g.paths.iter().any(|p| t.starts_with(resolve(p)))
 }
 
-/// p without `.` and `..`, with the links of the part that exists followed
-/// (/tmp is /private/tmp).
+/// Where p really is: links followed as far as the path exists, and `..`
+/// taken from where a link really leads (found in the security review:
+/// taking `..` as text first let `link/../x` reach past a link). /tmp is
+/// /private/tmp.
 pub fn resolve(p: &Path) -> std::path::PathBuf {
     use std::path::Component;
     let mut out = std::path::PathBuf::new();
     for c in p.components() {
         match c {
+            Component::CurDir => {}
             Component::ParentDir => {
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
                 out.pop();
             }
-            Component::CurDir => {}
-            c => out.push(c),
-        }
-    }
-    let (mut head, mut tail) = (out.clone(), Vec::new());
-    loop {
-        if let Ok(real) = head.canonicalize() {
-            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
-        }
-        match head.file_name() {
-            Some(n) => {
-                tail.push(n.to_owned());
-                head.pop();
+            c => {
+                out.push(c);
+                if let Ok(real) = out.canonicalize() {
+                    out = real;
+                }
             }
-            None => return out,
         }
     }
+    out
 }
 
 /// Reads a spoken/typed reply to a pending approval: Some(yes), Some(no), or
@@ -420,7 +431,7 @@ mod tests {
 
     fn guarded(names: bool) -> Guarded {
         let home = home_dir();
-        Guarded { paths: vec![home.join(".config/voice-agent"), home.join("voice-agent"), home.join("lfm3-vl-server")], names, base: home.join("agent-work") }
+        Guarded::new(vec![home.join(".config/voice-agent"), home.join("voice-agent"), home.join("lfm3-vl-server")], names, home.join("agent-work"))
     }
 
     #[test]
@@ -439,7 +450,7 @@ mod tests {
             ("Write", "file_path", "../voice-agent/src/app.rs".to_string()),
             ("Write", "file_path", format!("{home}/agent-work/../lfm3-vl-server/ios/LFM3/LFM3App.swift")),
         ] {
-            assert!(guard(tool, &input(k, &v), &g).is_some(), "{tool} {v}");
+            assert!(guard(tool, &input(k, &v), &g, None).is_some(), "{tool} {v}");
         }
         for (tool, k, v) in [
             ("Write", "file_path", format!("{home}/agent-work/notes.md")),
@@ -448,7 +459,7 @@ mod tests {
             // reading is not writing
             ("Read", "file_path", format!("{home}/voice-agent/src/app.rs")),
         ] {
-            assert!(guard(tool, &input(k, &v), &g).is_none(), "{tool} {v}");
+            assert!(guard(tool, &input(k, &v), &g, None).is_none(), "{tool} {v}");
         }
     }
 
@@ -466,19 +477,58 @@ mod tests {
                 "cp k.json \"$HOME/.config/voice-agent/devices.json\"".to_string(),
                 "echo x >> ${HOME}/lfm3-vl-server/scripts/start.sh".to_string(),
             ] {
-                assert!(guard(SHELL_RUN, &input("command", &cmd), &g).is_some(), "{names} {cmd}");
-                assert!(guard(JOB_START, &input("command", &cmd), &g).is_some(), "{names} {cmd}");
+                assert!(guard(SHELL_RUN, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
+                assert!(guard(JOB_START, &input("command", &cmd), &g, None).is_some(), "{names} {cmd}");
             }
-            assert!(guard(SHELL_INPUT, &input("text", "voice-agent pair 1\n"), &g).is_some());
-            assert!(guard(SHELL_RUN, &input("command", "cargo test && ls ~/agent-work"), &g).is_none());
+            assert!(guard(SHELL_INPUT, &input("text", "voice-agent pair 1\n"), &g, None).is_some());
+            assert!(guard(SHELL_RUN, &input("command", "cargo test && ls ~/agent-work"), &g, None).is_none());
         }
         // under serve the folders' names are enough
         let serve = guarded(true);
         for cmd in ["cd ~ && cd voice-agent && git pull", "cd .. && sed -i '' s/a/b/ lfm3-vl-server/server/app.py", "ls /x/voice-agent"] {
-            assert!(guard(SHELL_RUN, &input("command", cmd), &serve).is_some(), "{cmd}");
-            assert!(guard(SHELL_RUN, &input("command", cmd), &guarded(false)).is_none(), "{cmd}");
+            assert!(guard(SHELL_RUN, &input("command", cmd), &serve, None).is_some(), "{cmd}");
+            assert!(guard(SHELL_RUN, &input("command", cmd), &guarded(false), None).is_none(), "{cmd}");
         }
-        assert!(guard(SHELL_RUN, &input("command", "echo voice-agents-are-fun"), &serve).is_none());
+        assert!(guard(SHELL_RUN, &input("command", "echo voice-agents-are-fun"), &serve, None).is_none());
+    }
+
+    #[test]
+    fn a_link_does_not_lead_past_the_guard() {
+        let dir = std::env::temp_dir().join(format!("va-guard-link-{}", crate::util::unix_millis()));
+        std::fs::create_dir_all(dir.join("work")).unwrap();
+        std::fs::create_dir_all(dir.join("conf/sub")).unwrap();
+        std::os::unix::fs::symlink(dir.join("conf/sub"), dir.join("work/link")).unwrap();
+        let g = Guarded::new(vec![dir.join("conf")], false, dir.join("work"));
+        // link/.. is conf, where the link leads, not work
+        assert!(guard("Write", &input("file_path", "link/../devices.json"), &g, None).is_some());
+        assert!(guard("Write", &input("file_path", "link/x"), &g, None).is_some());
+        assert!(guard("Write", &input("file_path", "notes/../x"), &g, None).is_none());
+        assert_eq!(resolve(&dir.join("work/link/..")), resolve(&dir.join("conf")));
+    }
+
+    #[test]
+    fn the_guard_looks_at_where_a_command_runs() {
+        // found in the review: a command naming nothing guarded still wrote
+        // there when it ran in a guarded folder (job_start's dir, a shell
+        // started there, a shell that had moved there)
+        let g = guarded(true);
+        let home = home_dir().to_string_lossy().into_owned();
+        let job = |cmd: &str, dir: &str| {
+            let mut m = input("command", cmd);
+            m.insert("dir".into(), Value::String(dir.into()));
+            m
+        };
+        let inside = format!("{home}/lfm3-vl-server");
+        assert!(guard(JOB_START, &job("echo x >> scripts/start.sh", &inside), &g, Some(&inside)).is_some());
+        assert!(guard(SHELL_NEW, &input("dir", "~/voice-agent"), &g, Some("~/voice-agent")).is_some());
+        assert!(guard(SHELL_RUN, &input("command", "sed -i '' s/Deny/Allow/ src/agent/policy.rs"), &g, Some(&format!("{home}/voice-agent/src"))).is_some());
+        assert!(guard(SHELL_INPUT, &input("text", "ls\n"), &g, Some(&inside)).is_some());
+        // relative to the working directory, and out of it again
+        assert!(guard(SHELL_NEW, &input("dir", "../voice-agent"), &g, Some("../voice-agent")).is_some());
+        // elsewhere it runs
+        assert!(guard(JOB_START, &job("cargo build", "~/agent-work"), &g, Some("~/agent-work")).is_none());
+        assert!(guard(SHELL_RUN, &input("command", "ls"), &g, Some(&format!("{home}/agent-work"))).is_none());
+        assert!(guard(SHELL_NEW, &input("name", "w"), &g, None).is_none());
     }
 
     #[test]

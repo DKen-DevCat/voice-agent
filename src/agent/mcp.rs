@@ -2,7 +2,6 @@
 //! app, so claude's tools can reach the background shells and the UI
 //! directly. The server is named `va`, so the tools are `mcp__va__*`.
 
-use std::io::Read;
 use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
@@ -39,15 +38,7 @@ pub struct McpServer {
 }
 
 fn random_token() -> String {
-    let mut b = [0u8; 24];
-    if let Ok(mut f) = std::fs::File::open("/dev/urandom") {
-        let _ = f.read_exact(&mut b);
-    }
-    b.iter().map(|x| format!("{x:02x}")).collect()
-}
-
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0u8, |acc, (x, y)| acc | (x ^ y)) == 0
+    crate::util::random_bytes::<24>().iter().map(|x| format!("{x:02x}")).collect()
 }
 
 impl McpServer {
@@ -94,7 +85,7 @@ fn handle(mut req: tiny_http::Request, name: &str, want: &str, tools: &[Tool]) {
         let _ = req.respond(tiny_http::Response::empty(404));
         return;
     }
-    if !constant_time_eq(auth.as_bytes(), want.as_bytes()) {
+    if !crate::util::constant_time_eq(auth.as_bytes(), want.as_bytes()) {
         let _ = req.respond(tiny_http::Response::empty(401));
         return;
     }
@@ -175,6 +166,7 @@ fn dispatch(m: &Value, name: &str, tools: &[Tool]) -> Option<Value> {
 mod tests {
     use super::*;
     use crate::net;
+    use std::io::Read;
     use std::time::Duration;
 
     fn echo_tool() -> Tool {
