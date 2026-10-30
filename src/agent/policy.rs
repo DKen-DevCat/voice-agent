@@ -269,6 +269,108 @@ pub fn decide(tool: &str, input: &Map<String, Value>, deny: &[DenyRule]) -> Deci
     }
 }
 
+/// What voice-agent keeps out of the agent's reach (lfm3-vl-server
+/// docs/native-app.md §14.6): writing there is refused outright, whatever the
+/// tool. Always voice-agent's config directory (the paired iPhone's keys, the
+/// sessions) and its control socket; under serve also the folders approvals
+/// rest on (voice-agent's and lfm3-vl-server's), whose names are enough in a
+/// command. Commands are read as text, so a script can still get around it:
+/// this narrows the way, and the iPhone notices what gets through.
+#[derive(Clone, Debug, Default)]
+pub struct Guarded {
+    pub paths: Vec<std::path::PathBuf>,
+    /// Under serve: a command naming a guarded folder is refused too
+    pub names: bool,
+    /// Where relative paths start (Claude's working directory)
+    pub base: std::path::PathBuf,
+}
+
+pub const GUARD_REASON: &str = "voice-agent guards this (the paired iPhone's keys, its settings, and the folders approvals rest on): it is refused outright. Do not try to work around it; tell the user they can do it themselves at the Mac.";
+
+/// Claude Code's own tools that write files.
+const WRITE_TOOLS: [&str; 4] = ["Edit", "Write", "MultiEdit", "NotebookEdit"];
+
+pub fn guard(tool: &str, input: &Map<String, Value>, g: &Guarded) -> Option<String> {
+    let s = |k: &str| input.get(k).and_then(Value::as_str).unwrap_or_default();
+    let hit = match tool {
+        SHELL_RUN | JOB_START => command_touches(s("command"), g),
+        SHELL_INPUT => command_touches(s("text"), g),
+        _ if WRITE_TOOLS.contains(&tool) => ["file_path", "notebook_path", "path"].iter().any(|k| path_inside(s(k), g)),
+        _ => false,
+    };
+    hit.then(|| GUARD_REASON.to_string())
+}
+
+fn command_touches(cmd: &str, g: &Guarded) -> bool {
+    static SUB: OnceLock<Regex> = OnceLock::new();
+    let sub = SUB.get_or_init(|| Regex::new(&format!(r"\bvoice-agent\b{REST}\b(?:pair|unpair|serve)\b")).unwrap());
+    if sub.is_match(cmd) {
+        return true;
+    }
+    let home = home_dir();
+    g.paths.iter().any(|p| mentions(cmd, p, &home, g.names))
+}
+
+/// Whether cmd names p: in full, from ~ or $HOME, or (names) by its last part.
+fn mentions(cmd: &str, p: &Path, home: &Path, names: bool) -> bool {
+    let mut forms = vec![p.to_string_lossy().into_owned()];
+    if let Ok(rest) = p.strip_prefix(home)
+        && !home.as_os_str().is_empty()
+    {
+        let rest = rest.to_string_lossy();
+        forms.extend([format!("~/{rest}"), format!("$HOME/{rest}"), format!("${{HOME}}/{rest}")]);
+    }
+    if forms.iter().any(|f| cmd.contains(f.as_str())) {
+        return true;
+    }
+    names
+        && p.file_name().is_some_and(|n| {
+            let n = regex::escape(&n.to_string_lossy());
+            Regex::new(&format!(r#"(?:^|[\s/'"=:])\.?{n}(?:$|[\s/'";&|)])"#)).is_ok_and(|re| re.is_match(cmd))
+        })
+}
+
+fn path_inside(target: &str, g: &Guarded) -> bool {
+    if target.is_empty() {
+        return false;
+    }
+    let target = match target.strip_prefix("~/") {
+        Some(rest) => home_dir().join(rest),
+        None => g.base.join(target), // an absolute target replaces the base
+    };
+    let t = resolve(&target);
+    g.paths.iter().any(|p| t.starts_with(resolve(p)))
+}
+
+/// p without `.` and `..`, with the links of the part that exists followed
+/// (/tmp is /private/tmp).
+pub fn resolve(p: &Path) -> std::path::PathBuf {
+    use std::path::Component;
+    let mut out = std::path::PathBuf::new();
+    for c in p.components() {
+        match c {
+            Component::ParentDir => {
+                out.pop();
+            }
+            Component::CurDir => {}
+            c => out.push(c),
+        }
+    }
+    let (mut head, mut tail) = (out.clone(), Vec::new());
+    loop {
+        if let Ok(real) = head.canonicalize() {
+            return tail.iter().rev().fold(real, |acc, c| acc.join(c));
+        }
+        match head.file_name() {
+            Some(n) => {
+                tail.push(n.to_owned());
+                head.pop();
+            }
+            None => return out,
+        }
+    }
+}
+
 /// Reads a spoken/typed reply to a pending approval: Some(yes), Some(no), or
 /// None when it is neither (the approval then keeps waiting). A yes has to be
 /// the whole reply, since Japanese puts the negation at the end
@@ -314,6 +416,69 @@ mod tests {
             Decision::Ask(_) => "ask",
             Decision::Deny(_) => "deny",
         }
+    }
+
+    fn guarded(names: bool) -> Guarded {
+        let home = home_dir();
+        Guarded { paths: vec![home.join(".config/voice-agent"), home.join("voice-agent"), home.join("lfm3-vl-server")], names, base: home.join("agent-work") }
+    }
+
+    #[test]
+    fn the_guard_refuses_writes_with_any_tool() {
+        // found in the design review: the fixed refusals only looked at the
+        // shell tools, so Claude's own Write reached devices.json as an
+        // ordinary approval
+        let g = guarded(false);
+        let home = home_dir().to_string_lossy().into_owned();
+        for (tool, k, v) in [
+            ("Write", "file_path", format!("{home}/.config/voice-agent/devices.json")),
+            ("Edit", "file_path", "~/.config/voice-agent/sessions.json".to_string()),
+            ("MultiEdit", "file_path", format!("{home}/lfm3-vl-server/server/app.py")),
+            ("NotebookEdit", "notebook_path", format!("{home}/voice-agent/x.ipynb")),
+            // out of the working directory and back in
+            ("Write", "file_path", "../voice-agent/src/app.rs".to_string()),
+            ("Write", "file_path", format!("{home}/agent-work/../lfm3-vl-server/ios/LFM3/LFM3App.swift")),
+        ] {
+            assert!(guard(tool, &input(k, &v), &g).is_some(), "{tool} {v}");
+        }
+        for (tool, k, v) in [
+            ("Write", "file_path", format!("{home}/agent-work/notes.md")),
+            ("Write", "file_path", "notes.md".to_string()),
+            ("Write", "file_path", format!("{home}/voice-agent-notes/a.md")),
+            // reading is not writing
+            ("Read", "file_path", format!("{home}/voice-agent/src/app.rs")),
+        ] {
+            assert!(guard(tool, &input(k, &v), &g).is_none(), "{tool} {v}");
+        }
+    }
+
+    #[test]
+    fn the_guard_refuses_commands_that_name_what_it_guards() {
+        let home = home_dir().to_string_lossy().into_owned();
+        for names in [false, true] {
+            let g = guarded(names);
+            for cmd in [
+                "voice-agent pair 123456".to_string(),
+                "./target/release/voice-agent unpair".to_string(),
+                "nohup voice-agent serve --dir /tmp &".to_string(),
+                format!("cat x > {home}/.config/voice-agent/devices.json"),
+                "rm ~/.config/voice-agent/sessions.json".to_string(),
+                "cp k.json \"$HOME/.config/voice-agent/devices.json\"".to_string(),
+                "echo x >> ${HOME}/lfm3-vl-server/scripts/start.sh".to_string(),
+            ] {
+                assert!(guard(SHELL_RUN, &input("command", &cmd), &g).is_some(), "{names} {cmd}");
+                assert!(guard(JOB_START, &input("command", &cmd), &g).is_some(), "{names} {cmd}");
+            }
+            assert!(guard(SHELL_INPUT, &input("text", "voice-agent pair 1\n"), &g).is_some());
+            assert!(guard(SHELL_RUN, &input("command", "cargo test && ls ~/agent-work"), &g).is_none());
+        }
+        // under serve the folders' names are enough
+        let serve = guarded(true);
+        for cmd in ["cd ~ && cd voice-agent && git pull", "cd .. && sed -i '' s/a/b/ lfm3-vl-server/server/app.py", "ls /x/voice-agent"] {
+            assert!(guard(SHELL_RUN, &input("command", cmd), &serve).is_some(), "{cmd}");
+            assert!(guard(SHELL_RUN, &input("command", cmd), &guarded(false)).is_none(), "{cmd}");
+        }
+        assert!(guard(SHELL_RUN, &input("command", "echo voice-agents-are-fun"), &serve).is_none());
     }
 
     #[test]

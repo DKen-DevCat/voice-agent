@@ -41,6 +41,7 @@ struct State {
     streaming: bool, // a turn of the main conversation is under way
     ours: bool,      // ...and it answers a message sent (not one claude started itself)
     req_seq: u32,
+    retired: u64, // launches up to this one were ended on purpose (another conversation)
 }
 
 impl State {
@@ -128,6 +129,13 @@ impl ClaudeSession {
             let status = child.wait();
             let had_turn = {
                 let mut st = s.lock();
+                // Ended to move to another conversation: what it was doing is
+                // left behind, not ended with an error
+                if generation <= st.retired {
+                    drop(st);
+                    log(&format!("claude exited: {} (moved to another conversation)", status.map_or_else(|e| e.to_string(), |s| s.to_string())));
+                    return;
+                }
                 if st.generation == generation {
                     st.stdin = None;
                     st.pid = None;
@@ -295,6 +303,32 @@ impl ClaudeSession {
     pub fn stop(&self) {
         terminate(self.lock().pid);
     }
+
+    /// Claude's id for the conversation under way (empty before its first reply).
+    pub fn session_id(&self) -> String {
+        self.lock().session_id.clone()
+    }
+
+    /// Moves to another conversation (serve): this process ends, and the next
+    /// message starts claude on session (with --resume; a new one when it is
+    /// empty). A turn under way is left behind, and its subagents with it.
+    pub fn switch_to(&self, session: &str) {
+        let pid = {
+            let mut st = self.lock();
+            st.session_id = session.to_string();
+            // the resumed session is announced again
+            st.announced.clear();
+            st.retired = st.generation;
+            st.stdin = None;
+            st.done = st.sent;
+            st.streaming = false;
+            st.pid.take()
+        };
+        if let Some(a) = &self.agents {
+            a.stop_all();
+        }
+        terminate(pid);
+    }
 }
 
 fn terminate(pid: Option<u32>) {
@@ -309,6 +343,10 @@ mod tests {
     use super::*;
 
     fn session() -> (Arc<ClaudeSession>, Arc<Mutex<Vec<String>>>) {
+        session_at("claude".into())
+    }
+
+    fn session_at(bin: PathBuf) -> (Arc<ClaudeSession>, Arc<Mutex<Vec<String>>>) {
         let seen = Arc::new(Mutex::new(Vec::new()));
         let push = |seen: &Arc<Mutex<Vec<String>>>| {
             let s = seen.clone();
@@ -322,7 +360,67 @@ mod tests {
             on_tool_use: Box::new(move |name, input| tool(format!("tool {name} {}", Value::Object(input.clone())))),
             on_turn_end: Box::new(move |err, result| turn(format!("turn_end {err} {result}"))),
         };
-        (Arc::new(ClaudeSession::new("claude".into(), ".".into(), Vec::new(), Vec::new(), cb)), seen)
+        (Arc::new(ClaudeSession::new(bin, ".".into(), Vec::new(), Vec::new(), cb)), seen)
+    }
+
+    /// A stand-in for claude: it writes its arguments to args.log, takes the
+    /// session from --resume ("new" without it), and answers each message
+    /// after pause seconds.
+    fn fake_bin(dir: &std::path::Path, pause: &str) -> PathBuf {
+        let path = dir.join("claude");
+        let script = format!(
+            r#"#!/bin/sh
+echo "$@" >> '{log}'
+sid=new; prev=""
+for a in "$@"; do [ "$prev" = "--resume" ] && sid="$a"; prev="$a"; done
+while IFS= read -r line; do
+  printf '%s\n' '{{"type":"system","subtype":"init","session_id":"'"$sid"'","model":"fake"}}'
+  sleep {pause}
+  printf '%s\n' '{{"type":"result","subtype":"success","is_error":false,"result":"ok","session_id":"'"$sid"'"}}'
+done
+"#,
+            log = dir.join("args.log").display()
+        );
+        std::fs::write(&path, script).unwrap();
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o755)).unwrap();
+        path
+    }
+
+    fn wait_until(what: &str, f: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        while !f() {
+            assert!(std::time::Instant::now() < deadline, "{what}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn switching_resumes_the_other_session_and_leaves_the_turn_behind() {
+        let dir = std::env::temp_dir().join(format!("va-claude-switch-{}-{}", std::process::id(), crate::util::unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (s, seen) = session_at(fake_bin(&dir, "1"));
+        s.send("one").unwrap();
+        wait_until("the first session is ready", || s.session_id() == "new");
+        assert!(s.busy());
+        // another conversation, while the turn is under way
+        s.switch_to("s9");
+        assert!(!s.busy());
+        assert_eq!(s.session_id(), "s9");
+        s.send("two").unwrap();
+        wait_until("the reply in the other session", || seen.lock().unwrap().iter().any(|l| l == "turn_end false ok"));
+        let args = std::fs::read_to_string(dir.join("args.log")).unwrap();
+        let launches: Vec<&str> = args.lines().collect();
+        assert_eq!(launches.len(), 2);
+        assert!(!launches[0].contains("--resume"));
+        assert!(launches[1].ends_with("--resume s9"), "{}", launches[1]);
+        // the turn left behind did not end as an error
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(!seen.lock().unwrap().iter().any(|l| l.starts_with("turn_end true")), "{:?}", seen.lock().unwrap());
+        // each session is announced
+        assert!(seen.lock().unwrap().iter().any(|l| l == "ready new fake"));
+        assert!(seen.lock().unwrap().iter().any(|l| l == "ready s9 fake"));
+        s.stop();
     }
 
     #[test]

@@ -30,6 +30,7 @@ struct Raw {
     #[serde(rename = "holdMs")]
     hold_ms: u64,
     mascot: Option<bool>,
+    protect: Option<Vec<String>>,
 }
 
 #[derive(Clone, Debug)]
@@ -50,6 +51,11 @@ pub struct Config {
     pub hold_ms: u64,
     pub mascot: bool,
     pub persona: PathBuf,
+    /// The folders approvals rest on: serve's agent may not write there, and
+    /// its working directory may not be in or around them
+    pub protect: Vec<PathBuf>,
+    /// Where this was read from (its directory holds what serve keeps)
+    pub file: PathBuf,
 }
 
 fn or(s: String, default: &str) -> String {
@@ -112,6 +118,8 @@ impl Config {
             hold_ms: if r.hold_ms == 0 { 300 } else { r.hold_ms },
             mascot: r.mascot.unwrap_or(true),
             persona: file.with_file_name("persona.md"),
+            protect: r.protect.unwrap_or_else(|| vec!["~/voice-agent".into(), "~/lfm3-vl-server".into()]).iter().map(|p| expand(p)).collect(),
+            file: file.to_path_buf(),
         }
     }
 }
@@ -185,6 +193,8 @@ mod tests {
         ] {
             assert_eq!(default_of(key), format!("`{value}`"), "the default of {key}");
         }
+        assert_eq!(c.protect, [home.join("voice-agent"), home.join("lfm3-vl-server")]);
+        assert_eq!(default_of("protect"), "`[\"~/voice-agent\", \"~/lfm3-vl-server\"]`");
         // The two without a fixed value
         assert_eq!(default_of("dir"), "起動したディレクトリ");
         assert!(c.effort.is_empty() && default_of("effort") == "Claude Code の既定");

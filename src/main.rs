@@ -9,6 +9,7 @@ mod config;
 mod latency;
 mod log;
 mod net;
+mod serve;
 mod shell;
 mod speech;
 mod sysmon;
@@ -28,10 +29,17 @@ use ui::view::{TuiView, View};
 use ui::{Assistant, Effect, Ui};
 
 const USAGE: &str = "usage: voice-agent [--help | --version]
+       voice-agent serve --dir <working directory> [--port <port>]
+       voice-agent pair <code>
+       voice-agent unpair
 
 Runs in the terminal it is started in (a Ghostty window of its own is best).
 Hold Space and speak, t to type, y/n to answer an approval, m for the mic,
 Esc to stop everything, q to quit. See README.md.
+
+serve runs it for the iPhone app instead (no window, no mic, no speech on the
+Mac), behind lfm3-vl-server's wrapper. pair takes the code the iPhone shows;
+unpair forgets the paired iPhone.
 ";
 
 /// How often the window is drawn while nothing happens (the mascot moves).
@@ -51,6 +59,9 @@ fn main() {
             println!("voice-agent {}", env!("CARGO_PKG_VERSION"));
             0
         }
+        Some("serve") => serve::run(&args[1..]),
+        Some("pair") if args.len() == 2 => serve::pair(&args[1]),
+        Some("unpair") if args.len() == 1 => serve::unpair(),
         Some(other) => {
             eprint!("voice-agent: unknown argument {other:?}\n\n{USAGE}");
             2
