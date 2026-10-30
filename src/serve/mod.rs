@@ -229,7 +229,7 @@ pub fn check_workdir(dir: &Path, guarded: &[PathBuf]) -> Result<(), String> {
     let d = resolve(dir);
     for p in guarded {
         let g = resolve(p);
-        if d.starts_with(&g) || g.starts_with(&d) {
+        if crate::agent::policy::is_inside(&d, &g) || crate::agent::policy::is_inside(&g, &d) {
             return Err(format!("作業フォルダ {} は、守る場所 {} の中か、それを含む所です（native-app.md §14.3）", dir.display(), p.display()));
         }
     }
@@ -297,7 +297,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     // The process works there too: a relative dir given to a job or a shell
     // starts from it, as the guard reads it (start.sh runs this from inside
-    // lfm3-vl-server)
+    // lfm3-vl-server, or WKEN-AGENTS after the rename)
     if let Err(e) = std::fs::create_dir_all(&dir).and(crate::util::private_dir(&rt)).and_then(|_| std::env::set_current_dir(&dir)) {
         eprintln!("voice-agent: {e}");
         return 1;
@@ -702,11 +702,24 @@ done
     #[test]
     fn the_working_directory_stays_clear_of_what_is_guarded() {
         let home = crate::util::home_dir();
-        let guarded = [home.join("voice-agent"), home.join("lfm3-vl-server"), home.join(".config/voice-agent")];
+        let guarded = [home.join("voice-agent"), home.join("lfm3-vl-server"), home.join("WKEN-AGENTS"), home.join(".config/voice-agent")];
         assert!(check_workdir(&home.join("agent-work"), &guarded).is_ok());
         // found in the design review: start.sh moves into lfm3-vl-server,
         // where acceptEdits would let Claude edit without asking
         assert!(check_workdir(&home.join("lfm3-vl-server"), &guarded).is_err());
+        // lfm3-vl-server is being renamed WKEN-AGENTS (2026-10-31)
+        assert!(check_workdir(&home.join("WKEN-AGENTS"), &guarded).is_err());
+        assert!(check_workdir(&home.join("WKEN-AGENTS/server"), &guarded).is_err());
+        // case does not matter on the Mac's volume; the boundary stays whole components
+        for p in ["wken-agents", "Wken-Agents/server", "LFM3-VL-SERVER", "Voice-Agent/sub", ".Config/voice-agent"] {
+            assert!(check_workdir(&home.join(p), &guarded).is_err(), "{p}");
+        }
+        assert!(check_workdir(&home.join("wken-agents-notes"), &guarded).is_ok());
+        // APFS folds the full way (checked 2026-10-31): the long s and the fi ligature
+        for p in ["WKEN-AGENTſ", "wken-agentſ/x", "lfm3-vl-ſerver", ".conﬁg/voice-agent", ".CONﬁG/voice-agent/x"] {
+            assert!(check_workdir(&home.join(p), &guarded).is_err(), "{p}");
+        }
+        assert!(check_workdir(&home.join("WKEN-AGENﬆ"), &guarded).is_ok());
         assert!(check_workdir(&home.join("voice-agent/sub"), &guarded).is_err());
         assert!(check_workdir(&home, &guarded).is_err(), "home holds them all");
         assert!(check_workdir(Path::new("/"), &guarded).is_err());
