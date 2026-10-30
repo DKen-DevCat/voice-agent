@@ -28,7 +28,7 @@ pub struct JobInfo {
     pub started: i64, // unix milliseconds
     pub ended: i64,   // 0 while it runs
     pub exit: Option<i32>,
-    pub stopped: bool, // ended by job_stop (or by voice-agent quitting)
+    pub stopped: bool, // ended by job_stop, Esc, or voice-agent quitting
 }
 
 /// How long a stopped job's processes get after SIGTERM, before SIGKILL.
@@ -160,18 +160,20 @@ impl Jobs {
     }
 
     /// Stops every job that has anything left, and waits for them (SIGKILL
-    /// after STOP_GRACE): voice-agent is quitting.
-    pub fn stop_all(&self) {
-        let pids: Vec<u32> = {
+    /// after STOP_GRACE): Esc, or voice-agent quitting. Returns the jobs it
+    /// stopped.
+    pub fn stop_all(&self) -> Vec<JobInfo> {
+        let jobs: Vec<JobInfo> = {
             let mut st = self.lock();
             st.iter_mut()
                 .filter(|j| j.running() || group_alive(j.pid))
                 .map(|j| {
                     j.stopped = true;
-                    j.pid
+                    j.clone()
                 })
                 .collect()
         };
+        let pids: Vec<u32> = jobs.iter().map(|j| j.pid).collect();
         for &pid in &pids {
             signal_group(pid, libc::SIGTERM);
         }
@@ -182,6 +184,7 @@ impl Jobs {
         for &pid in pids.iter().filter(|&&p| group_alive(p)) {
             signal_group(pid, libc::SIGKILL);
         }
+        jobs
     }
 }
 

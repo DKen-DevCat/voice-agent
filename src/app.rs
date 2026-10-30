@@ -164,6 +164,8 @@ struct State {
     last_status: String,
     ap_seq: u32,
     stt_err: String,
+    /// Jobs Esc stopped, for Claude to hear of with the next message
+    jobs_stopped: Vec<String>,
 }
 
 type Deliver = Box<dyn Fn(Vec<Event>) + Send + Sync>;
@@ -714,7 +716,7 @@ impl Controller {
             // A reply silenced before is over; this one is heard
             self.lock().hushed = false;
         }
-        let msg = format!("{text}\n\n<va_context>main shell cwd: {}</va_context>", self.cwd());
+        let msg = format!("{text}\n\n<va_context>{}</va_context>", self.context());
         match claude.send(&msg) {
             Ok(()) => {
                 if !busy {
@@ -755,8 +757,8 @@ impl Controller {
         self.status();
     }
 
-    /// Esc and 「生成もストップ」: that, and the reply is interrupted too.
-    /// Jobs keep running; job_stop ends them.
+    /// Esc and 「生成もストップ」: that, and the reply is interrupted too, and
+    /// the jobs are stopped.
     pub fn abort(self: &Arc<Self>) {
         self.hush();
         self.deny_all("The user aborted.");
@@ -768,6 +770,22 @@ impl Controller {
         self.agents.stop_all();
         self.emit(Event::new(EventKind::Notice, ABORTED));
         self.status();
+        // Waits up to STOP_GRACE for what does not end at once (the key
+        // handler calls this on a thread of its own)
+        let stopped = self.jobs.stop_all();
+        self.lock().jobs_stopped.extend(stopped.iter().map(|j| format!("#{} {}", j.id, j.command.trim())));
+    }
+
+    /// What Claude is told with a message: where the main shell is, and the
+    /// jobs Esc has stopped since the last message (Claude would take them
+    /// to be running).
+    fn context(&self) -> String {
+        let stopped = std::mem::take(&mut self.lock().jobs_stopped);
+        let mut ctx = format!("main shell cwd: {}", self.cwd());
+        if !stopped.is_empty() {
+            ctx.push_str(&format!("\njobs the user stopped with Esc: {}", stopped.join(", ")));
+        }
+        ctx
     }
 
     /// Silences the speech and the rest of the reply; the half sentence the
@@ -1290,6 +1308,25 @@ mod tests {
         assert!(c.permit(SHELL_RUN, &args(json!({"command": "git commit --amend -m x"}))).unwrap_err().contains("fixed policy"));
         assert_eq!(c.permit(SHELL_RUN, &args(json!({"command": "ls"}))), Ok(()));
         assert_eq!(kinds(&events, EventKind::Approval).len(), 2, "neither asked");
+    }
+
+    /// Esc (and 「生成もストップ」) stops the jobs too; 「止めて」 leaves them be.
+    #[test]
+    fn esc_stops_the_jobs() {
+        let dir = std::env::temp_dir().join(format!("va-jobs-{}-{}", std::process::id(), unix_millis()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let (c, _) = controller_with(Hooks::default(), &dir);
+        let job = c.jobs.start("sleep 20", None).unwrap();
+        c.stop();
+        std::thread::sleep(Duration::from_millis(200));
+        assert_eq!(c.running().1, 1, "「止めて」 leaves the job running");
+        c.abort();
+        wait_for("the job is stopped", || c.running().1 == 0);
+        // Claude hears of it with the next message, once
+        assert!(c.context().contains(&format!("jobs the user stopped with Esc: #{} sleep 20", job.id)));
+        assert!(!c.context().contains("jobs the user stopped"));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&c.runtime_dir);
     }
 
     #[test]

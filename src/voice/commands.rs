@@ -10,7 +10,8 @@ use regex::Regex;
 pub enum Command {
     /// 「止めて」: stop speaking and Ctrl-C what runs in the shells
     Stop,
-    /// 「生成もストップ」: that, and Claude's reply is interrupted too
+    /// 「生成もストップ」: that, and Claude's reply is interrupted and the jobs
+    /// are stopped too (as Esc)
     StopAll,
     /// 「マイクを切って」: let go of the microphone (the m key brings it back)
     MicOff,
