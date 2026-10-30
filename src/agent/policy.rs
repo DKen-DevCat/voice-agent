@@ -273,7 +273,7 @@ pub fn decide(tool: &str, input: &Map<String, Value>, deny: &[DenyRule]) -> Deci
 /// docs/native-app.md §14.6): writing there is refused outright, whatever the
 /// tool. Always voice-agent's config directory (the paired iPhone's keys, the
 /// sessions) and its control socket; under serve also the folders approvals
-/// rest on (voice-agent's and lfm3-vl-server's), whose names are enough in a
+/// rest on (voice-agent's and lfm3-vl-server's, now WKEN-AGENTS too), whose names are enough in a
 /// command. Commands are read as text, so a script can still get around it:
 /// this narrows the way, and the iPhone notices what gets through.
 #[derive(Clone, Debug, Default)]

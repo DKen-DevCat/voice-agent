@@ -297,7 +297,7 @@ pub fn run(args: &[String]) -> i32 {
     }
     // The process works there too: a relative dir given to a job or a shell
     // starts from it, as the guard reads it (start.sh runs this from inside
-    // lfm3-vl-server)
+    // lfm3-vl-server, or WKEN-AGENTS after the rename)
     if let Err(e) = std::fs::create_dir_all(&dir).and(crate::util::private_dir(&rt)).and_then(|_| std::env::set_current_dir(&dir)) {
         eprintln!("voice-agent: {e}");
         return 1;
